@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import shutil
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -15,9 +17,10 @@ def create_server(host: str, port: int, service: WebApiService, web_root: Path |
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8765) -> None:
-    project_root = Path(__file__).resolve().parents[1]
-    service = WebApiService(base_dir=project_root, config_path=project_root / "competitor_monitor" / "config.yaml")
-    server = create_server(host, port, service, project_root / "web_frontend")
+    project_root = runtime_base_dir()
+    config_path = ensure_local_config(project_root)
+    service = WebApiService(base_dir=project_root, config_path=config_path)
+    server = create_server(host, port, service, find_web_root(project_root))
     print(f"Web 控制台已启动：http://{host}:{port}")
     try:
         server.serve_forever()
@@ -25,6 +28,40 @@ def run_server(host: str = "127.0.0.1", port: int = 8765) -> None:
         print("\nWeb 控制台已停止")
     finally:
         server.server_close()
+
+
+def runtime_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+def find_web_root(base_dir: Path) -> Path:
+    candidates = [base_dir / "web_frontend"]
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        candidates.append(Path(bundled_root) / "web_frontend")
+    candidates.append(Path(__file__).resolve().parents[1] / "web_frontend")
+    for candidate in candidates:
+        if (candidate / "index.html").exists():
+            return candidate
+    return candidates[0]
+
+
+def ensure_local_config(base_dir: Path) -> Path:
+    config_path = base_dir / "competitor_monitor" / "config.yaml"
+    if config_path.exists():
+        return config_path
+    example_candidates = [base_dir / "competitor_monitor" / "config.example.yaml"]
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        example_candidates.append(Path(bundled_root) / "competitor_monitor" / "config.example.yaml")
+    for example_path in example_candidates:
+        if example_path.exists():
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(example_path, config_path)
+            return config_path
+    return config_path
 
 
 def _build_handler(service: WebApiService, web_root: Path):

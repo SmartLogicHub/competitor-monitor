@@ -596,7 +596,7 @@ def run_collection(
             if is_ambiguous_product and not enable_sku_matching and not allow_ambiguous_sku_collection:
                 stats.skipped += 1
                 logger.warning(
-                    "SKU 姝т箟璺宠繃锛歴heet=%s row=%s 鍟嗗搧=%s 閾炬帴=%s 鍘熷洜=鍚屼竴鍟嗗搧閾炬帴瀵瑰簲澶氫釜 Excel 鍨嬪彿锛屼笖 enable_sku_matching=false",
+                    "SKU 歧义跳过：sheet=%s row=%s 商品=%s 链接=%s 原因=同一商品链接对应多个 Excel 型号，且 enable_sku_matching=false",
                     worksheet.title,
                     product.row,
                     product.name,
@@ -614,7 +614,7 @@ def run_collection(
             ):
                 stats.skipped += 1
                 logger.info(
-                    "閸撳秴绨禒閿嬬壐閸忋劋璐?/ 閿涘矁鐑︽潻鍥ㄦ拱閺冦儵鍣伴梿鍡窗sheet=%s row=%s 閸熷棗鎼?%s",
+                    "历史价格均为 /，跳过疑似下架商品：sheet=%s row=%s 商品=%s",
                     worksheet.title,
                     product.row,
                     product.name,

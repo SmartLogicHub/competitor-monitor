@@ -77,6 +77,30 @@ Web 控制台支持：
 
 双击 `web_frontend/index.html` 会进入 mock 预览模式，不连接后端。
 
+## 后台自动运行
+
+Web 页面只负责展示和手动控制，不负责触发自动通知。真正用于 Windows 定时任务的后台入口是：
+
+```bash
+python competitor_monitor/run_web_task.py --mode daily_price
+python competitor_monitor/run_web_task.py --mode weekly_new
+python competitor_monitor/run_web_task.py --mode price_trend
+```
+
+该入口复用 Web 后端服务层，任务完成后会根据配置自动发送企业微信摘要和 Excel 文件。
+
+推荐定时安排：
+
+- 周一到周五每天运行 `daily_price`。
+- 周六运行 `weekly_new`，目标是上一完整周一到周五周期。
+- 周五收盘后或周六补跑 `price_trend`。
+
+项目根目录提供：
+
+- `scripts/install_windows_tasks.ps1`：安装 Windows 定时任务。
+- `scripts/remove_windows_tasks.ps1`：删除 Windows 定时任务。
+- `打包EXE.bat`：生成 Web 控制台和后台任务执行器 exe。
+
 ## 企业微信发送
 
 企业微信通知由后端触发：

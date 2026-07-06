@@ -55,6 +55,66 @@ python competitor_monitor/web_server.py
 http://127.0.0.1:8765
 ```
 
+## 后台自动运行
+
+Web 页面只是控制台，不是自动通知的触发源。真正的后台自动任务使用：
+
+```bash
+python competitor_monitor/run_web_task.py --mode daily_price
+python competitor_monitor/run_web_task.py --mode weekly_new
+python competitor_monitor/run_web_task.py --mode price_trend
+```
+
+这个入口会复用 Web 后端服务层。任务完成后，如果 `competitor_monitor/config.yaml` 中启用了企业微信，后端会自动发送运行摘要和 Excel 文件。
+
+## Windows 定时任务
+
+创建本机定时任务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_windows_tasks.ps1
+```
+
+默认会创建 4 个任务：
+
+- `CompetitorMonitor-WebConsole`：Windows 登录后启动本地 Web 控制台。
+- `CompetitorMonitor-DailyPrice`：周一到周五 `10:00` 运行 `daily_price`。
+- `CompetitorMonitor-WeeklyNew`：周六 `09:30` 运行 `weekly_new`。
+- `CompetitorMonitor-PriceTrend`：周五 `18:30` 运行 `price_trend`。
+
+自定义时间：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_windows_tasks.ps1 -DailyTime "10:30" -WeeklyNewTime "09:30" -PriceTrendTime "18:30"
+```
+
+删除这些定时任务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\remove_windows_tasks.ps1
+```
+
+## 打包 exe
+
+构建 exe：
+
+```text
+双击 打包EXE.bat
+```
+
+构建完成后会生成：
+
+- `dist\CompetitorMonitorWeb\CompetitorMonitorWeb.exe`
+- `dist\CompetitorMonitorTaskRunner\CompetitorMonitorTaskRunner.exe`
+
+打包产物不会包含你的 Excel、浏览器登录态、secrets、日志和备份。正式使用前，需要在运行目录放置 Excel 文件，并按实际环境配置 `competitor_monitor/config.yaml`。
+
+如果要让 Windows 定时任务使用 exe 版本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_windows_tasks.ps1 -UseExe
+```
+
 ## 安全说明
 
 仓库默认不提交以下本地数据：

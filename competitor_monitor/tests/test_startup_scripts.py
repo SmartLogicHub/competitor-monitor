@@ -16,6 +16,32 @@ class StartupScriptsTest(unittest.TestCase):
         self.assertIn("127.0.0.1:8765", bat_text)
         self.assertIn("Start-Process", bat_text)
 
+    def test_delivery_scripts_exist_and_keep_runtime_data_local(self):
+        project_root = Path(__file__).resolve().parents[2]
+        build_script = project_root / "打包EXE.bat"
+        install_tasks_script = project_root / "scripts" / "install_windows_tasks.ps1"
+        remove_tasks_script = project_root / "scripts" / "remove_windows_tasks.ps1"
+
+        self.assertTrue(build_script.exists())
+        self.assertTrue(install_tasks_script.exists())
+        self.assertTrue(remove_tasks_script.exists())
+
+        build_text = build_script.read_text(encoding="utf-8-sig")
+        install_text = install_tasks_script.read_text(encoding="utf-8-sig")
+        remove_text = remove_tasks_script.read_text(encoding="utf-8-sig")
+
+        self.assertIn("pyinstaller", build_text.lower())
+        self.assertIn("competitor_monitor\\web_server.py", build_text)
+        self.assertIn("CompetitorMonitorWeb", build_text)
+        self.assertIn("CompetitorMonitorTaskRunner", build_text)
+        self.assertIn("Register-ScheduledTask", install_text)
+        self.assertIn("*Web.bat", install_text)
+        self.assertIn("daily_price", install_text)
+        self.assertIn("weekly_new", install_text)
+        self.assertIn("price_trend", install_text)
+        self.assertIn("CompetitorMonitor-DailyPrice", install_text)
+        self.assertIn("Unregister-ScheduledTask", remove_text)
+
 
 if __name__ == "__main__":
     unittest.main()
