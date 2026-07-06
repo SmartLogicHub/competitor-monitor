@@ -13,6 +13,7 @@ env/
 # Local app/runtime artifacts
 .agents/
 .playwright-cli/
+.playwright-mcp/
 output/
 logs/
 backup/
