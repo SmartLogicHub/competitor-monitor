@@ -1,0 +1,115 @@
+excel_path: "竞品监控.xlsx"
+backup_dir: "competitor_monitor/backup"
+log_dir: "competitor_monitor/logs"
+daily_run_time: "10:00"
+mode: "daily_price"
+rows: ""
+limit: ""
+save_every: 5
+force_overwrite: false
+
+price_trend_enabled: true
+price_trend_auto_update: true
+price_trend_allowed_weekdays:
+  - 4
+force_overwrite_price_trend: false
+
+enable_sku_matching: true
+allow_ambiguous_sku_collection: false
+blocked_unmatched_sku_fallback_models:
+  - "A5"
+manual_price_overrides: []
+
+price_alert_enabled: true
+price_alert_threshold_percent: 20
+price_alert_min_abs_diff: 20
+skip_when_previous_prices_all_slash: false
+fallback_to_previous_price_when_uncertain: true
+
+headless: false
+timeout_ms: 30000
+retry_count: 2
+min_delay_seconds: 5
+max_delay_seconds: 10
+save_every_n_products: 5
+
+browser_user_data_dir: "competitor_monitor/browser_profile"
+browser_storage_state_path: "competitor_monitor/browser_profile/storage_state.json"
+browser_channel: "chrome"
+browser_executable_path: ""
+fallback_to_bundled_browser: true
+viewport_width: 1920
+viewport_height: 1080
+locale: "zh-CN"
+timezone_id: "Asia/Shanghai"
+longitude: "116.4"
+latitude: "39.9"
+chrome_major_version: 149
+user_agent: ""
+operation_min_delay_seconds: 3
+operation_max_delay_seconds: 10
+
+taobao_login_check_enabled: true
+taobao_login_check_url: "https://www.taobao.com/"
+taobao_login_state_check_attempts: 3
+taobao_login_state_check_seconds: 2
+manual_action_timeout_seconds: 300
+manual_action_poll_seconds: 2
+taobao_username_env: "TAOBAO_USER"
+taobao_password_env: "TAOBAO_PASSWORD"
+taobao_credentials_path: "competitor_monitor/secrets/taobao_credentials.json"
+
+new_product_enabled: true
+new_product_mode: "bi"
+auto_backfill_missing_daily_prices_before_weekly_new: true
+new_product_allowed_weekdays:
+  - 5
+  - 6
+new_product_no_data_text: "无上新"
+force_overwrite_new_products: false
+
+bi_login_url: "https://mbz.ecbis.cn/login"
+bi_new_monitoring_url: "https://mbz.ecbis.cn/workTable/newMonitoring"
+bi_api_base_url: "https://biplugs.ecbis.cn"
+bi_platform: "TX"
+bi_browser_user_data_dir: "competitor_monitor/browser_profile_bi"
+bi_username_env: "BI_USER"
+bi_password_env: "BI_PASSWORD"
+bi_credentials_path: "competitor_monitor/secrets/bi_credentials.json"
+bi_min_delay_seconds: 1
+bi_max_delay_seconds: 3
+
+wecom_enabled: false
+wecom_webhook: ""
+wecom_send_summary: true
+wecom_send_excel_file: true
+wecom_file_size_limit_mb: 20
+
+new_product_brand_shop_aliases: {}
+activity_mapping:
+  国补:
+    - "政府补贴"
+    - "国补"
+  跟价协议:
+    - "超级爆款"
+  超级立减:
+    - "超级立减"
+    - "立减"
+  限时补贴:
+    - "限时补贴"
+  限时红包:
+    - "限时红包"
+  淘金币:
+    - "淘金币"
+  首单礼金:
+    - "首单礼金"
+  消费券:
+    - "消费券"
+    - "平台消费券"
+  百亿补贴:
+    - "百亿补贴"
+keep_original_activities: []
+
+run_date: ""
+dry_run: false
+test_one: false

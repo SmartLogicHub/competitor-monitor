@@ -1,0 +1,56 @@
+# Python cache/build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Local app/runtime artifacts
+.agents/
+.playwright-cli/
+output/
+logs/
+backup/
+backup_acceptance/
+backup_real_test/
+
+# Browser profiles and login sessions
+browser_profile*/
+**/browser_profile*/
+**/browser_profile_bi*/
+**/browser_profile_bi_probe/
+**/browser_profile_inspect/
+**/browser_profile_smoke/
+
+# Logs, backups, generated data
+competitor_monitor/logs/
+competitor_monitor/backup/
+competitor_monitor/backup_acceptance/
+competitor_monitor/backup_real_test/
+competitor_monitor/data/
+data/
+
+# Secrets and local credentials
+competitor_monitor/secrets/
+secrets/
+
+# Local configs that may contain real paths, accounts, or webhooks
+competitor_monitor/config.yaml
+competitor_monitor/config_*.yaml
+
+# Excel and exported business data
+*.xlsx
+*.xls
+*.csv
+tmp*.xlsx
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+browser_data/
+browser_profile*/
+logs/*.log
+logs/*.png
+logs/*.json
+logs/*.txt
+backup/*.xlsx
+secrets/*.json

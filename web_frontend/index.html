@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>竞品监控 Web 控制台</title>
+  <meta name="description" content="竞品监控 Excel 自动填报与企业微信发送控制台">
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="bg-glow-pink"></div>
+  <div class="bg-glow-blue"></div>
+  <div id="offline-banner" class="offline-banner">
+    <span class="status-dot danger"></span>
+    <span>本地服务暂时不可用，当前显示最近缓存状态</span>
+  </div>
+
+  <div class="app-shell">
+    <aside class="side-nav" aria-label="主导航">
+      <div>
+        <div class="brand">
+          <div class="brand-mark">竞</div>
+          <div>
+            <div class="brand-name">竞品监控</div>
+            <div class="brand-subtitle">Excel 自动填报</div>
+          </div>
+        </div>
+        <nav class="nav-list">
+          <button class="nav-item active" data-tab="tab-console"><span>自动任务</span><span class="nav-state-dot active"></span></button>
+          <button class="nav-item" data-tab="tab-logs"><span>运行日志</span><span class="nav-state-dot warning"></span></button>
+          <button class="nav-item" data-tab="tab-results"><span>结果记录</span><span class="nav-state-dot success"></span></button>
+          <button class="nav-item" data-tab="tab-config"><span>系统配置</span><span class="nav-state-dot neutral"></span></button>
+        </nav>
+      </div>
+
+      <div class="side-summary">
+        <div class="summary-label">主模板</div>
+        <div id="side-template-name" class="summary-value">竞品监控.xlsx</div>
+        <div class="side-status-line">
+          <span id="side-health-dot" class="status-dot ok"></span>
+          <span id="side-health-text">待命</span>
+        </div>
+        <div class="side-meter">
+          <div class="side-meter-top"><span>完整度</span><strong id="side-energy-text">0%</strong></div>
+          <div class="side-meter-track"><span id="side-energy-fill"></span></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="top-bar">
+        <div>
+          <h1 id="page-display-title">自动任务中心</h1>
+          <p id="page-subtitle">识别日期、写入主 Excel 模板、检查完整性并推送企业微信</p>
+        </div>
+        <div class="top-actions">
+          <div class="status-capsules">
+            <span id="global-status-badge" class="badge ok" style="padding: 6px 12px; font-size: 13px;">
+              <span class="status-dot ok" style="margin-right: 6px;"></span>系统健康监控中
+            </span>
+          </div>
+          <button id="btn-refresh" class="btn ghost" type="button">刷新</button>
+        </div>
+      </header>
+      <div id="global-energy-strip" class="global-energy-strip neutral"><span></span></div>
+
+      <section id="tab-console" class="tab-panel active">
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <span class="kpi-label">📊 采集进度与吞吐</span>
+            <div class="kpi-value-row">
+              <span id="kpi-progress-done">0</span><span class="kpi-divider">/</span><span id="kpi-progress-total">0</span>
+            </div>
+            <div class="kpi-subtext">成功 <strong id="kpi-success" class="text-success">0</strong> | 异常 <strong id="kpi-failed">0</strong></div>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-label">🔒 爬虫通道健康度</span>
+            <div class="kpi-status-list">
+              <div class="kpi-status-item">
+                <span>淘宝登录</span>
+                <span id="kpi-tb-status" class="badge neutral">待检测</span>
+              </div>
+              <div class="kpi-status-item">
+                <span>BI 登录</span>
+                <span id="kpi-bi-status" class="badge neutral">待检测</span>
+              </div>
+            </div>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-label">📈 数据链路完整率</span>
+            <div class="kpi-value-row">
+              <span id="kpi-completeness-pct">0%</span>
+            </div>
+            <div class="kpi-progress-mini">
+              <div id="kpi-completeness-bar" class="kpi-progress-bar" style="width: 0%"></div>
+            </div>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-label">🛠️ 自动运维监控</span>
+            <div class="kpi-value-row">
+              <span id="kpi-backup-count">0</span><span class="kpi-unit">份备份</span>
+            </div>
+            <div class="kpi-subtext">已释放 Session: <strong id="kpi-session-count">0</strong></div>
+          </div>
+        </div>
+
+        <div class="task-grid">
+          <article class="task-card" id="daily-task-card">
+            <div class="task-card-header">
+              <div style="display: flex; align-items: flex-start; gap: 12px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: linear-gradient(135deg, rgba(59,130,246,0.1), rgba(6,182,212,0.1)); color: #3B82F6; display: flex; align-items: center; justify-content: center;">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                </div>
+                <div>
+                  <p class="eyebrow">工作日自动任务</p>
+                  <h2>每日价格采集</h2>
+                </div>
+              </div>
+              <span id="daily-status" class="badge neutral">待命</span>
+            </div>
+            <div class="task-meta-grid">
+              <div><span>计划</span><strong id="daily-schedule">每天 10:00</strong></div>
+              <div>
+                <span>目标 sheet <span class="tooltip-trigger">? <span class="tooltip-bubble">本次数据写入的 Excel 工作表名称。</span></span></span>
+                <strong id="daily-template-status">-</strong>
+              </div>
+              <div><span>最近结果</span><strong id="daily-last-result">-</strong></div>
+              <div><span>当前步骤</span><strong id="daily-next-run">-</strong></div>
+            </div>
+            <div class="task-actions">
+              <button id="btn-run-daily" class="btn secondary" type="button">手动运行</button>
+              <button id="btn-stop-task" class="btn ghost" type="button">请求停止</button>
+            </div>
+            <div class="task-feedback-line"><span id="daily-feedback-line"></span></div>
+            <div class="card-overlay" id="daily-overlay" style="display: none;">
+              <span class="status-dot warning" style="margin-right: 8px;"></span> 爬虫正在采集中，请稍候...
+            </div>
+          </article>
+
+          <article class="task-card" id="weekly-task-card">
+            <div class="task-card-header">
+              <div style="display: flex; align-items: flex-start; gap: 12px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: linear-gradient(135deg, rgba(245,158,11,0.1), rgba(252,211,77,0.1)); color: #F59E0B; display: flex; align-items: center; justify-content: center;">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                </div>
+                <div>
+                  <p class="eyebrow">周末自动任务</p>
+                  <h2>周末 BI 上新采集</h2>
+                </div>
+              </div>
+              <span id="weekly-status" class="badge neutral">待命</span>
+            </div>
+            <div class="task-meta-grid">
+              <div><span>计划</span><strong id="weekly-schedule">周六 / 周日</strong></div>
+              <div><span>目标周期</span><strong id="weekly-target-period">-</strong></div>
+              <div><span>预检查</span><strong id="weekly-precheck">-</strong></div>
+              <div><span>企微推送</span><strong id="weekly-notify-status">-</strong></div>
+            </div>
+            <div class="task-actions">
+              <button id="btn-run-weekly" class="btn secondary" type="button">手动运行 BI</button>
+              <button id="btn-backfill-missing" class="btn ghost" type="button">补跑缺失日期</button>
+            </div>
+            <div class="card-overlay" id="weekly-overlay" style="display: none;">
+              <span class="status-dot warning" style="margin-right: 8px;"></span> BI 爬虫启动中，请稍候...
+            </div>
+          </article>
+        </div>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div style="display: flex; align-items: flex-start; gap: 12px;">
+              <div style="width: 32px; height: 32px; border-radius: 8px; background: linear-gradient(135deg, rgba(16,185,129,0.1), rgba(52,211,153,0.1)); color: #10B981; display: flex; align-items: center; justify-content: center;">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
+              </div>
+              <div>
+                <p class="eyebrow">数据链路监控</p>
+                <h2>数据采集流水线 <span class="tooltip-trigger" style="font-size: 14px; font-weight: normal; margin-left: 4px;">? <span class="tooltip-bubble" style="font-weight: normal; line-height: 1.4; text-transform: none;">展示本周 5 天内每天的抓取和写入校验，支持异常的补跑。</span></span></h2>
+              </div>
+            </div>
+            <div class="button-row">
+              <button id="btn-loop-check" class="btn ghost small" type="button">检查完整性</button>
+              <button id="btn-loop-primary" class="btn secondary small" type="button">流水线操作菜单 ▾</button>
+            </div>
+          </div>
+          <div class="loop-meta">
+            <div><span>目标 sheet</span><strong id="loop-target-sheet">-</strong></div>
+            <div><span>目标周期</span><strong id="loop-target-period">-</strong></div>
+            <div><span>最近保存</span><strong id="loop-saved-at">-</strong></div>
+            <div><span>企微推送</span><strong id="loop-sent-at">-</strong></div>
+          </div>
+          <div id="energy-cells" class="energy-cells"></div>
+          <div id="workflow-list" class="workflow-list"></div>
+        </section>
+
+        <section class="panel two-column-panel">
+          <div>
+            <div class="panel-header">
+              <div style="display: flex; align-items: flex-start; gap: 12px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: rgba(15, 23, 42, 0.05); color: #64748B; display: flex; align-items: center; justify-content: center;">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                </div>
+                <div>
+                  <p class="eyebrow">最近日志</p>
+                  <h2>运行摘要</h2>
+                </div>
+              </div>
+            </div>
+            <div id="console-log-preview" class="log-list compact"></div>
+          </div>
+          <div>
+            <div class="panel-header">
+              <div style="display: flex; align-items: flex-start; gap: 12px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: linear-gradient(135deg, rgba(244,63,94,0.1), rgba(251,113,133,0.1)); color: #F43F5E; display: flex; align-items: center; justify-content: center;">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                </div>
+                <div>
+                  <p class="eyebrow">企业微信</p>
+                  <h2>推送与通知状态</h2>
+                </div>
+              </div>
+              <div class="button-row">
+                <button id="btn-download-excel" class="btn secondary small" type="button">导出本次结果</button>
+                <button id="btn-send-template-main" class="btn primary small" type="button">发送当前模板</button>
+              </div>
+            </div>
+            <div class="notify-card">
+              <div>
+                <span>文字摘要 <span class="tooltip-trigger">? <span class="tooltip-bubble">已采集数据的简短文字说明，直接显示在企业微信通知中。</span></span></span>
+                <strong id="notify-text-status">not_sent</strong>
+              </div>
+              <div>
+                <span>Excel 文件 <span class="tooltip-trigger">? <span class="tooltip-bubble">抓取完毕后经过拼贴校验的 Excel 数据源附件。</span></span></span>
+                <strong id="notify-file-status">not_sent</strong>
+              </div>
+              <div><span>发送时间</span><strong id="notify-time">-</strong></div>
+              <div><span>文件名</span><strong id="notify-file-name">-</strong></div>
+              <div><span>失败原因</span><strong id="notify-error">-</strong></div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section id="tab-logs" class="tab-panel">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">日志</p>
+              <h2>运行日志</h2>
+            </div>
+            <div class="toolbar">
+              <label class="toggle-switch-container" style="margin-right: 12px;">
+                <input id="log-auto-scroll" type="checkbox" checked>
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">🔒 自动滚屏</span>
+              </label>
+              <select id="log-filter-level" class="form-control">
+                <option value="all">全部</option>
+                <option value="info">info</option>
+                <option value="warning">warning</option>
+                <option value="error">error</option>
+                <option value="success">success</option>
+              </select>
+              <input id="log-search-query" class="form-control" type="search" placeholder="搜索日志">
+              <button id="btn-clear-logs" class="btn secondary" type="button">清空当前视图日志</button>
+            </div>
+          </div>
+          <div id="logs-table-body" class="log-list"></div>
+          <div id="logs-empty-state" class="empty-state">
+            <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom: 12px; opacity: 0.35;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+            <div>暂无运行日志</div>
+          </div>
+        </section>
+      </section>
+
+      <section id="tab-results" class="tab-panel">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">结果</p>
+              <h2>结果记录</h2>
+            </div>
+            <div class="toolbar">
+              <select id="result-filter-status" class="form-control">
+                <option value="all">全部状态</option>
+                <option value="success">成功</option>
+                <option value="failed">失败</option>
+                <option value="skipped">跳过</option>
+              </select>
+              <select id="result-filter-mode" class="form-control">
+                <option value="all">全部任务</option>
+                <option value="daily_price">每日价格</option>
+                <option value="weekly_new">周末 BI</option>
+                <option value="price_trend">价格情况</option>
+              </select>
+              <input id="result-search-query" class="form-control" type="search" placeholder="搜索品牌或型号">
+              <button id="btn-export-results" class="btn secondary" type="button">导出本次结果</button>
+            </div>
+          </div>
+          <div class="quick-filters">
+            <button class="quick-filter active" data-result-quick="all" type="button">全部</button>
+            <button class="quick-filter" data-result-quick="failed" type="button">只看失败</button>
+            <button class="quick-filter" data-result-quick="today" type="button">今日</button>
+          </div>
+          <div id="results-table-body" class="result-list"></div>
+          <div id="results-empty-state" class="empty-state">
+            <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom: 12px; opacity: 0.35;"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect><line x1="7" y1="2" x2="7" y2="22"></line><line x1="17" y1="2" x2="17" y2="22"></line><line x1="2" y1="12" x2="22" y2="12"></line><line x1="2" y1="7" x2="7" y2="7"></line><line x1="2" y1="17" x2="7" y2="17"></line><line x1="17" y1="17" x2="22" y2="17"></line><line x1="17" y1="7" x2="22" y2="7"></line></svg>
+            <div>暂无结果记录</div>
+          </div>
+        </section>
+      </section>
+
+      <section id="tab-config" class="tab-panel">
+        <form id="config-form" class="config-layout">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">计划</p>
+                <h2>自动运行计划</h2>
+              </div>
+              <button id="btn-save-config" class="btn primary" type="submit">保存配置</button>
+            </div>
+            <div class="settings-grid">
+              <label class="field">每日价格时间<input id="cfg-daily-time" class="form-control" type="time" value="10:00"></label>
+              <label class="field">允许周六运行 BI<select id="cfg-bi-sat" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
+              <label class="field">允许周日运行 BI<select id="cfg-bi-sun" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
+              <label class="field">缺失自动补跑<select id="cfg-auto-backfill" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">推送</p>
+                <h2>企业微信</h2>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <label class="field">启用推送<select id="cfg-wecom-enabled" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
+              <label class="field">发送摘要<select id="cfg-wecom-summary" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
+              <label class="field">发送 Excel 文件<select id="cfg-wecom-template" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
+              <label class="field wide">
+                <span>Webhook</span>
+                <div class="password-input-wrapper">
+                  <input id="cfg-wecom-webhook" class="form-control" type="password" placeholder="已保存时显示 ******">
+                  <button type="button" class="btn-toggle-password" data-target="cfg-wecom-webhook" aria-label="切换密码可见性">👁️</button>
+                </div>
+              </label>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">文件与账号</p>
+                <h2>Excel 与登录状态</h2>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <label class="field wide">模板路径<input id="cfg-excel-path" class="form-control" type="text"></label>
+              <label class="field">淘宝浏览器登录检测<input id="cfg-taobao-login-status" class="form-control" type="text" readonly></label>
+              <label class="field">淘宝账号凭据<input id="cfg-taobao-credential-status" class="form-control" type="text" readonly></label>
+              <label class="field">BI 浏览器登录检测<input id="cfg-bi-login-status" class="form-control" type="text" readonly></label>
+              <label class="field">BI 账号凭据<input id="cfg-bi-credential-status" class="form-control" type="text" readonly></label>
+              <label class="field">淘宝账号<input id="cfg-taobao-username" class="form-control" type="text" autocomplete="username"></label>
+              <label class="field">
+                <span>淘宝密码</span>
+                <div class="password-input-wrapper">
+                  <input id="cfg-taobao-password" class="form-control" type="password" autocomplete="current-password">
+                  <button type="button" class="btn-toggle-password" data-target="cfg-taobao-password" aria-label="切换密码可见性">👁️</button>
+                </div>
+              </label>
+              <label class="field">BI 账号<input id="cfg-bi-username" class="form-control" type="text"></label>
+              <label class="field">
+                <span>BI 密码</span>
+                <div class="password-input-wrapper">
+                  <input id="cfg-bi-password" class="form-control" type="password">
+                  <button type="button" class="btn-toggle-password" data-target="cfg-bi-password" aria-label="切换密码可见性">👁️</button>
+                </div>
+              </label>
+              <div class="button-row">
+                <button id="btn-reset-taobao" class="btn secondary" type="button">清除淘宝浏览器状态</button>
+                <button id="btn-reset-bi" class="btn secondary" type="button">清除 BI 浏览器状态</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">高级</p>
+                <h2>调试参数</h2>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <label class="field">运行模式<select id="cfg-mode" class="form-control"><option value="daily_price">daily_price</option><option value="weekly_new">weekly_new</option><option value="price_trend">price_trend</option><option value="all">all</option></select></label>
+              <label class="field">运行日期<input id="cfg-run-date" class="form-control" type="date"></label>
+              <label class="field">只做安全检查<select id="cfg-dry-run" class="form-control"><option value="false">关闭</option><option value="true">开启 dry-run</option></select></label>
+              <label class="field">只测试一条<select id="cfg-test-one" class="form-control"><option value="false">关闭</option><option value="true">开启 test-one</option></select></label>
+              <label class="field">行范围<input id="cfg-rows" class="form-control" type="text" placeholder="如 24,54,60-62"></label>
+              <label class="field">限制数量<input id="cfg-limit" class="form-control" type="number" min="0"></label>
+              <label class="field">保存间隔<input id="cfg-save-every" class="form-control" type="number" min="0"></label>
+            </div>
+          </section>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div id="drawer-backdrop" class="drawer-backdrop" style="display: none;"></div>
+
+  <aside id="detail-drawer" class="detail-drawer" aria-hidden="true">
+    <div class="detail-header">
+      <h2>结果详情</h2>
+      <button id="btn-close-detail" class="btn ghost small" type="button">关闭</button>
+    </div>
+    <pre id="detail-content"></pre>
+  </aside>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script src="uiState.js"></script>
+  <script src="mockData.js"></script>
+  <script src="api.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
