@@ -260,6 +260,22 @@ class BrowserServiceConfigTest(unittest.TestCase):
         self.assertEqual(page.filled["input[placeholder*='登录密码']"], "pass1")
         self.assertEqual(page.clicked_selectors, ["#fm-agreement-checkbox", "button.fm-submit"])
 
+    def test_taobao_auto_login_rechecks_home_after_merchant_workbench_redirect(self):
+        page = FakeMerchantWorkbenchAfterLoginPage()
+        service = BrowserService(
+            headless=True,
+            timeout_ms=1000,
+            context_config={"operation_min_delay_seconds": 0, "operation_max_delay_seconds": 0},
+        )
+        service.wait_after_operation = lambda: 0
+
+        state = service.login_taobao(page, AccountCredentials(username="seller", password="pass1"))
+
+        self.assertEqual(state, PageAuthState.AUTHENTICATED)
+        self.assertEqual(page.url, "https://www.taobao.com/")
+        self.assertEqual(page.goto_urls, ["https://www.taobao.com/"])
+        self.assertEqual(page.clicked_selectors, ["#fm-agreement-checkbox", "button.fm-submit"])
+
     def test_taobao_auto_login_waits_between_human_sensitive_steps(self):
         page = FakeNewTaobaoPasswordLoginPage()
         service = BrowserService(
@@ -671,6 +687,21 @@ class FakeVerificationReturnsToLoginPage(FakeNewTaobaoPasswordLoginPage):
         elif self.state_after_submit == "login":
             self.url = "https://www.taobao.com/"
             self.body = "tb39655791 淘宝网首页"
+
+
+class FakeMerchantWorkbenchAfterLoginPage(FakeNewTaobaoPasswordLoginPage):
+    def __init__(self):
+        super().__init__()
+        self.goto_urls = []
+
+    def goto(self, url, wait_until="domcontentloaded", timeout=0):
+        self.goto_urls.append(url)
+        self.url = url
+        self.body = "tb39655791 淘宝网首页"
+
+    def mark_submitted(self):
+        self.url = "https://qianniu.taobao.com/home.htm"
+        self.body = "千牛工作台 交易 商品 店铺"
 
 
 class FakeManualResolutionPage(FakeTextPage):

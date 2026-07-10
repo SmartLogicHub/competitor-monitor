@@ -30,6 +30,14 @@ VERIFY_KEYWORDS = ["验证码", "滑块", "安全验证", "人机验证", "登�
 TAOBAO_LOGIN_CHECK_URL = "https://www.taobao.com/"
 TAOBAO_LOGIN_URL = "https://login.taobao.com/member/login.jhtml"
 LOGIN_URL_MARKERS = ("login.taobao.com", "login.tmall.com")
+MERCHANT_WORKBENCH_URL_MARKERS = (
+    "qianniu.taobao.com",
+    "qn.taobao.com",
+    "myseller.taobao.com",
+    "seller.taobao.com",
+    "sell.taobao.com",
+    "work.taobao.com",
+)
 LOGIN_TEXT_MARKERS = ("亲，请登录", "请登录后", "账号登录", "密码登录")
 MANUAL_ACTION_URL_MARKERS = ("passport.taobao.com", "verify", "authcenter")
 MANUAL_ACTION_MARKERS = (
@@ -106,6 +114,11 @@ def detect_page_auth_state(page) -> PageAuthState:
     if "账号" in combined and "密码" in combined and "登录" in combined:
         return PageAuthState.LOGIN_REQUIRED
     return PageAuthState.AUTHENTICATED
+
+
+def _is_merchant_workbench_url(url: str) -> bool:
+    current_url = str(url or "").lower()
+    return any(marker in current_url for marker in MERCHANT_WORKBENCH_URL_MARKERS)
 
 
 def build_browser_launch_args(extra_args: list[str] | None = None) -> list[str]:
@@ -292,6 +305,7 @@ class BrowserService:
             if self._taobao_auto_login_attempts < self._taobao_auto_login_max_attempts():
                 return self.login_taobao(page, credentials)
             state = self._pause_for_manual_action(page, "自动登录未确认成功。请在浏览器中检查并完成登录，程序会自动继续...")
+        state = self._confirm_taobao_auth_after_merchant_redirect(page, state)
         return state
 
     def click(self, page, target, **kwargs):
@@ -335,6 +349,7 @@ class BrowserService:
             if state == PageAuthState.LOGIN_REQUIRED and self.taobao_credentials and self._taobao_auto_login_attempts < self._taobao_auto_login_max_attempts():
                 state = self.login_taobao(page, self.taobao_credentials)
             state = self._wait_for_auth_state_to_settle(page)
+        state = self._confirm_taobao_auth_after_merchant_redirect(page, state)
         self._persist_auth_state_if_authenticated(page)
         return state
 
@@ -360,6 +375,19 @@ class BrowserService:
                 context.add_cookies(cookies)
         except Exception:
             pass
+
+    def _confirm_taobao_auth_after_merchant_redirect(self, page, state: PageAuthState) -> PageAuthState:
+        if state != PageAuthState.AUTHENTICATED:
+            return state
+        if not _is_merchant_workbench_url(getattr(page, "url", "")):
+            return state
+        check_url = self.context_config.get("taobao_login_check_url", TAOBAO_LOGIN_CHECK_URL)
+        try:
+            page.goto(check_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            self.wait_after_operation()
+            return self._wait_for_auth_state_to_settle(page)
+        except Exception:
+            return state
 
     def _wait_for_auth_state_to_settle(self, page) -> PageAuthState:
         attempts = max(1, int(self.context_config.get("taobao_login_state_check_attempts", 3)))
