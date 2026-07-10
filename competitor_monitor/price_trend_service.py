@@ -46,13 +46,8 @@ def extract_lowest_price(value) -> Decimal | None:
 
 
 def classify_price_trend(values: Iterable[object]) -> str | None:
-    prices: list[Decimal] = []
-    for value in values:
-        price = extract_lowest_price(value)
-        if price is None:
-            return None
-        prices.append(price)
-    if len(prices) != 5:
+    prices = _extract_trend_prices(values)
+    if prices is None:
         return None
 
     compressed = [prices[0]]
@@ -74,7 +69,7 @@ def classify_price_trend(values: Iterable[object]) -> str | None:
         return TREND_DOWN_THEN_UP
     if first_negative is not None and all(sign > 0 for sign in signs[:first_negative]) and all(sign < 0 for sign in signs[first_negative:]):
         return TREND_UP_THEN_DOWN
-    return None
+    return _describe_direction_sequence(signs)
 
 
 def update_price_trends(
@@ -93,17 +88,14 @@ def update_price_trends(
         if not _cell_text(worksheet.cell(row=row, column=layout.model_column)):
             continue
         total += 1
-        values = [worksheet.cell(row=row, column=column).value for column in date_columns]
-        if len(date_columns) != 5 or any(extract_lowest_price(value) is None for value in values):
-            skipped_incomplete += 1
-            continue
-        trend = classify_price_trend(values)
-        if trend is None:
-            skipped_unclassified += 1
-            continue
         status_cell = worksheet.cell(row=row, column=layout.price_status_column)
         if _cell_text(status_cell) and not force_overwrite:
             skipped_existing += 1
+            continue
+        values = [worksheet.cell(row=row, column=column).value for column in date_columns]
+        trend = classify_price_trend(values)
+        if trend is None:
+            skipped_incomplete += 1
             continue
         status_cell.value = trend
         written += 1
@@ -119,3 +111,15 @@ def update_price_trends(
 
 def _cell_text(cell) -> str:
     return str(cell.value).strip() if cell.value is not None else ""
+
+
+def _extract_trend_prices(values: Iterable[object]) -> list[Decimal] | None:
+    parsed = [price for price in (extract_lowest_price(value) for value in values) if price is not None]
+    if len(parsed) < 2:
+        return None
+    return parsed
+
+
+def _describe_direction_sequence(signs: Iterable[int]) -> str:
+    words = ["涨" if sign > 0 else "跌" for sign in signs]
+    return "、".join(("先" if index == 0 else "再") + word for index, word in enumerate(words))
