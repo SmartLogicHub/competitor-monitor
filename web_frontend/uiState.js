@@ -17,7 +17,7 @@
   function buildAutomationView(tasksStatus = {}, completeness = {}) {
     const missingDates = Array.isArray(completeness.missing_dates) ? completeness.missing_dates : [];
     const systemStatus = tasksStatus.system_status || "idle";
-    const running = ["running", "backfilling", "saving", "sending"].includes(systemStatus);
+    const running = isLiveStatus(systemStatus);
     const complete = Boolean(completeness.complete) && missingDates.length === 0;
     const energyPercent = completeness.energy_percent ?? calculateEnergyPercent(completeness.days || []);
     const tone = running ? "active" : complete ? "success" : missingDates.length ? "warning" : statusTone(systemStatus);
@@ -108,6 +108,18 @@
     return "neutral";
   }
 
+  function isLiveStatus(status) {
+    return ["running", "backfilling", "saving", "sending"].includes(status);
+  }
+
+  function activeTaskId(tasksStatus = {}) {
+    if (!isLiveStatus(tasksStatus.system_status)) return null;
+    const mode = tasksStatus.active_mode;
+    if (mode === "weekly_new") return "weekly_new";
+    if (mode === "price_trend") return "price_trend";
+    return "daily_price";
+  }
+
   function statusText(status) {
     const map = {
       idle: "待命",
@@ -161,6 +173,8 @@
     calculateEnergyPercent,
     statusTone,
     statusText,
+    isLiveStatus,
+    activeTaskId,
     formatDay,
     formatDayFillText,
     formatDayFillPercent

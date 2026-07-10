@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
+import re
 import shutil
 import sys
+import traceback
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import urlopen
 
 from web_api import WebApiService
 
@@ -17,20 +22,69 @@ def create_server(host: str, port: int, service: WebApiService, web_root: Path |
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8765) -> None:
+    url = _console_url(host, port)
+    if _health_is_available(url):
+        _open_web_console(url)
+        return
+
     project_root = runtime_base_dir()
     config_path = ensure_local_config(project_root)
     service = WebApiService(base_dir=project_root, config_path=config_path)
     server = create_server(host, port, service, find_web_root(project_root))
-    print(f"Web 控制台已启动：http://{host}:{port}")
+    _open_web_console(url)
+    _safe_print(f"Web 控制台已启动：http://{host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nWeb 控制台已停止")
+        _safe_print("\nWeb 控制台已停止")
     finally:
         server.server_close()
 
 
+def _safe_print(message: str) -> None:
+    try:
+        print(message)
+    except Exception:
+        return
+
+
+def _console_url(host: str, port: int) -> str:
+    display_host = "127.0.0.1" if host in {"", "0.0.0.0"} else host
+    return f"http://{display_host}:{port}/"
+
+
+def _health_is_available(url: str) -> bool:
+    try:
+        with urlopen(url.rstrip("/") + "/api/health", timeout=1) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def _open_web_console(url: str) -> None:
+    try:
+        webbrowser.open(url, new=2)
+    except Exception:
+        return
+
+
+def _write_startup_error(exc: BaseException) -> None:
+    try:
+        base_dir = runtime_base_dir()
+        log_dir = base_dir / "competitor_monitor" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "web_server_startup.log").write_text(
+            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            encoding="utf-8",
+        )
+    except Exception:
+        return
+
+
 def runtime_base_dir() -> Path:
+    override = os.environ.get("COMPETITOR_MONITOR_RUNTIME_DIR")
+    if override:
+        return Path(override).resolve()
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
@@ -79,6 +133,10 @@ def _build_handler(service: WebApiService, web_root: Path):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             try:
+                if parsed.path == "/api/template/upload":
+                    filename, content = self._read_multipart_file()
+                    self._send_json(service.upload_template(filename, content))
+                    return
                 payload = self._read_json()
                 if parsed.path == "/api/tasks/run":
                     self._send_json(service.run_task(payload))
@@ -86,6 +144,8 @@ def _build_handler(service: WebApiService, web_root: Path):
                     self._send_json(service.stop_task())
                 elif parsed.path == "/api/template/backfill":
                     self._send_json(service.backfill_template(payload))
+                elif parsed.path == "/api/template/sync-latest":
+                    self._send_json(service.sync_latest_template())
                 elif parsed.path == "/api/notify/send-template":
                     self._send_json(service.send_template())
                 elif parsed.path == "/api/config":
@@ -116,6 +176,8 @@ def _build_handler(service: WebApiService, web_root: Path):
                 self._send_json(service.get_tasks_status())
             elif path == "/api/template/completeness":
                 self._send_json(service.get_template_completeness(_query_one(query, "date")))
+            elif path == "/api/template/download":
+                self._send_file(service.get_template_file())
             elif path == "/api/config":
                 self._send_json(service.get_config())
             elif path == "/api/logs":
@@ -174,6 +236,31 @@ def _build_handler(service: WebApiService, web_root: Path):
             raw = self.rfile.read(length).decode("utf-8")
             return json.loads(raw) if raw else {}
 
+        def _read_multipart_file(self) -> tuple[str, bytes]:
+            content_type = self.headers.get("Content-Type", "")
+            boundary_marker = "boundary="
+            if boundary_marker not in content_type:
+                raise ValueError("上传请求缺少 multipart boundary")
+            boundary = content_type.split(boundary_marker, 1)[1].strip().strip('"')
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length)
+            delimiter = f"--{boundary}".encode("utf-8")
+            for part in body.split(delimiter):
+                part = part.strip()
+                if not part or part == b"--":
+                    continue
+                if part.endswith(b"--"):
+                    part = part[:-2].strip()
+                header_bytes, separator, content = part.partition(b"\r\n\r\n")
+                if not separator:
+                    continue
+                headers = header_bytes.decode("utf-8", errors="replace")
+                if "filename=" not in headers:
+                    continue
+                filename = _multipart_filename(headers)
+                return filename, content.rstrip(b"\r\n")
+            raise ValueError("上传请求中没有找到 Excel 文件")
+
         def _send_json(self, payload, status: int = 200) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -189,6 +276,19 @@ def _build_handler(service: WebApiService, web_root: Path):
             self.send_header("Content-Length", str(len(data)))
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_file(self, path: Path) -> None:
+            data = path.read_bytes()
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{quote(path.name)}",
+            )
             self.end_headers()
             self.wfile.write(data)
 
@@ -208,5 +308,16 @@ def _with_charset(content_type: str) -> str:
     return content_type
 
 
+def _multipart_filename(headers: str) -> str:
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\r\n]+)"?', headers, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip() or "template.xlsx"
+    return "template.xlsx"
+
+
 if __name__ == "__main__":
-    run_server()
+    try:
+        run_server()
+    except Exception as exc:
+        _write_startup_error(exc)
+        raise

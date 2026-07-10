@@ -36,7 +36,7 @@
         } catch (_) {}
         throw new Error(message);
       }
-      if (url.includes("/export")) return response.blob();
+      if (url.includes("/export") || url.includes("/download")) return response.blob();
       return response.json();
     } catch (error) {
       if (error instanceof TypeError && error.message.includes("fetch")) {
@@ -132,6 +132,59 @@
     return request("/api/notify/send-template", "POST");
   };
 
+  API.downloadTemplate = async function () {
+    if (API.USE_MOCK) {
+      return mockDelay(() => {
+        const payload = {
+          note: "mock 模式没有真实 Excel 文件；接入后端后会下载当前主 Excel。",
+          template_name: window.CompetitorMonitorMock.tasksStatus.template_name
+        };
+        return new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+      });
+    }
+    return request("/api/template/download");
+  };
+
+  API.uploadTemplate = async function (file) {
+    if (API.USE_MOCK) {
+      return mockDelay(() => {
+        const mock = window.CompetitorMonitorMock;
+        mock.config.template_name = file.name;
+        mock.config.template_path = `项目根目录/${file.name}`;
+        mock.config.template_uploaded_at = currentTimestamp();
+        mock.config.template_validation_status = "mock 模式未做真实校验";
+        mock.tasksStatus.template_name = file.name;
+        mock.tasksStatus.template_path = `项目根目录/${file.name}`;
+        mock.logs.unshift(makeLog("success", "模板上传请求已记录", "mock 模式不会替换本地 Excel，真实替换由后端接口完成。"));
+        return { message: "模板上传请求已记录（mock 模式）", file_name: file.name };
+      });
+    }
+    const form = new FormData();
+    form.append("template", file, file.name);
+    return requestForm("/api/template/upload", form);
+  };
+
+  API.syncTemplate = async function () {
+    if (API.USE_MOCK) {
+      return mockDelay(() => {
+        const mock = window.CompetitorMonitorMock;
+        mock.config.workbook_sync_status = "synced";
+        mock.config.workbook_sync_status_text = "已同步";
+        mock.config.pending_sync_path = null;
+        mock.config.last_workbook_sync_at = currentTimestamp();
+        mock.config.last_workbook_sync_error = null;
+        mock.tasksStatus.workbook_sync_status = "synced";
+        mock.tasksStatus.workbook_sync_status_text = "已同步";
+        mock.tasksStatus.pending_sync_path = null;
+        mock.tasksStatus.last_workbook_sync_at = mock.config.last_workbook_sync_at;
+        mock.tasksStatus.last_workbook_sync_error = null;
+        mock.logs.unshift(makeLog("success", "主模板已同步", "当前最新工作簿已写回主模板。"));
+        return { message: "主模板已同步", sync_status: "synced" };
+      });
+    }
+    return request("/api/template/sync-latest", "POST");
+  };
+
   API.getConfig = async function () {
     if (API.USE_MOCK) return mockDelay(() => clone(window.CompetitorMonitorMock.config));
     return request("/api/config");
@@ -173,11 +226,35 @@
     return request("/api/results/export");
   };
 
+  async function requestForm(url, form) {
+    try {
+      const response = await fetch(`${API.BASE_URL}${url}`, { method: "POST", body: form });
+      if (isOffline) {
+        isOffline = false;
+        if (connectionRestoreCallback) connectionRestoreCallback();
+      }
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.message || payload.error || `HTTP ${response.status}`);
+      return payload;
+    } catch (error) {
+      if (error instanceof TypeError && error.message.includes("fetch")) {
+        if (!isOffline) {
+          isOffline = true;
+          if (connectionErrorCallback) connectionErrorCallback();
+        }
+      }
+      throw error;
+    }
+  }
+
   API.cleanupMaintenance = async function (scope) {
     if (API.USE_MOCK) {
       return mockDelay(() => {
         if (scope === "logs") window.CompetitorMonitorMock.logs = [];
-        return { message: scope === "logs" ? "当前视图日志已清空" : "清理请求已记录" };
+        if (scope === "results") window.CompetitorMonitorMock.results = [];
+        if (scope === "logs") return { message: "当前视图日志已清空" };
+        if (scope === "results") return { message: "结果记录已清空，Excel、日志和备份文件未删除" };
+        return { message: "清理请求已记录" };
       });
     }
     return request("/api/maintenance/cleanup", "POST", { scope });

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
+import os
 import re
 import shutil
 import tempfile
@@ -9,6 +12,7 @@ import posixpath
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Callable
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 from openpyxl import load_workbook
@@ -34,6 +38,10 @@ CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types
 
 
 class WorkbookLayoutError(RuntimeError):
+    pass
+
+
+class WorkbookLockedError(PermissionError):
     pass
 
 
@@ -106,10 +114,63 @@ def backup_excel(excel_path: Path | str, backup_dir: Path | str) -> Path:
     return target
 
 
+class _WindowsExclusiveFile:
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    def __init__(self, path: Path):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateFileW(
+            str(path),
+            self.GENERIC_READ | self.GENERIC_WRITE,
+            0,
+            None,
+            self.OPEN_EXISTING,
+            self.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if handle in (self.INVALID_HANDLE_VALUE, -1, None):
+            raise PermissionError(ctypes.WinError(ctypes.get_last_error()))
+        self._kernel32 = kernel32
+        self._handle = handle
+
+    def close(self) -> None:
+        handle = getattr(self, "_handle", None)
+        if handle not in (None, self.INVALID_HANDLE_VALUE, -1):
+            self._kernel32.CloseHandle(handle)
+            self._handle = None
+
+
+SaveFallback = Callable[[Path, Path, Exception], Path]
+
+
 class ExcelService:
-    def __init__(self, excel_path: Path | str):
+    def __init__(
+        self,
+        excel_path: Path | str,
+        save_fallback: SaveFallback | None = None,
+        fallback_replace_attempts: int = 3,
+    ):
         self.excel_path = Path(excel_path)
         self._compatible_copy_path: Path | None = None
+        self._save_fallback = save_fallback
+        self._fallback_replace_attempts = max(1, int(fallback_replace_attempts))
+        self._using_fallback_path = False
 
     def load_workbook(self):
         """Load workbook with a compatibility fallback for WPS-style empty fill nodes."""
@@ -121,8 +182,56 @@ class ExcelService:
             self._compatible_copy_path = self._create_openpyxl_compatible_copy()
             return load_workbook(self._compatible_copy_path)
 
+    @staticmethod
+    def assert_workbook_writable(path: Path | str) -> None:
+        target = Path(path)
+        if not target.exists():
+            raise FileNotFoundError(f"当前 Excel 文件不存在：{target}")
+        handle = None
+        try:
+            handle = ExcelService._open_file_exclusive(target)
+        except PermissionError as exc:
+            raise WorkbookLockedError(
+                f"当前 Excel 文件被占用，请关闭 Excel/WPS/预览窗口后再运行：{target}"
+            ) from exc
+        finally:
+            if handle is not None:
+                handle.close()
+
+    @staticmethod
+    def wait_workbook_writable(
+        path: Path | str,
+        timeout_seconds: float = 30.0,
+        delay_seconds: float = 1.0,
+        on_wait=None,
+    ) -> None:
+        delay = delay_seconds if delay_seconds > 0 else 1.0
+        attempts = max(1, int(timeout_seconds / delay) + 1)
+        last_error: WorkbookLockedError | None = None
+        for attempt_index in range(attempts):
+            try:
+                ExcelService.assert_workbook_writable(path)
+                return
+            except WorkbookLockedError as exc:
+                last_error = exc
+                if attempt_index == attempts - 1:
+                    break
+                remaining = max(0, int(round(timeout_seconds - ((attempt_index + 1) * delay))))
+                if on_wait is not None:
+                    on_wait(attempt_index + 1, remaining)
+                time.sleep(delay)
+        if last_error is not None:
+            raise last_error
+
+    @staticmethod
+    def _open_file_exclusive(path: Path):
+        if os.name == "nt":
+            return _WindowsExclusiveFile(path)
+        return path.open("r+b")
+
     def save_workbook(self, workbook, output_path: Path | str | None = None) -> Path:
-        target = Path(output_path) if output_path else self.excel_path
+        requested_target = Path(output_path) if output_path else self.excel_path
+        target = self.excel_path if self._using_fallback_path and requested_target != self.excel_path else requested_target
         target.parent.mkdir(parents=True, exist_ok=True)
         suffix = target.suffix or ".xlsx"
         format_state = self._read_workbook_format_state(target) if target.exists() else {}
@@ -134,16 +243,27 @@ class ExcelService:
         try:
             workbook.save(temp_path)
             self._restore_workbook_format_state(temp_path, format_state)
+            self._apply_mature_product_hyperlink_visual_state(temp_path)
             self._restore_sheet_tab_color_states(temp_path, tab_color_states)
             self._restore_drawing_package_state(temp_path, drawing_state)
-            self._replace_file_with_retry(temp_path, target)
+            replace_kwargs = {}
+            if self._save_fallback is not None:
+                replace_kwargs["attempts"] = self._fallback_replace_attempts
+            self._replace_file_with_retry(temp_path, target, **replace_kwargs)
+        except WorkbookLockedError as exc:
+            if self._save_fallback is None:
+                raise
+            fallback_path = Path(self._save_fallback(temp_path, target, exc))
+            self.excel_path = fallback_path
+            self._using_fallback_path = True
+            return fallback_path
         finally:
             if temp_path.exists():
                 temp_path.unlink()
         return target
 
     @staticmethod
-    def _replace_file_with_retry(source: Path, target: Path, attempts: int = 5, delay_seconds: float = 0.2) -> None:
+    def _replace_file_with_retry(source: Path, target: Path, attempts: int = 30, delay_seconds: float = 1.0) -> None:
         last_error: PermissionError | None = None
         for attempt in range(attempts):
             try:
@@ -155,7 +275,9 @@ class ExcelService:
                     break
                 time.sleep(delay_seconds)
         if last_error is not None:
-            raise last_error
+            raise WorkbookLockedError(
+                f"当前 Excel 文件被占用，请关闭 Excel/WPS/预览窗口后再运行：{target}"
+            ) from last_error
 
     def get_or_create_current_sheet(self, workbook, target_date: date) -> Worksheet:
         existing = self.find_sheet_for_date(workbook, target_date)
@@ -614,6 +736,171 @@ class ExcelService:
         return state
 
     @classmethod
+    def _apply_mature_product_hyperlink_visual_state(cls, path: Path) -> None:
+        rewritten_path: Path | None = None
+        try:
+            with ZipFile(path, "r") as source:
+                names = set(source.namelist())
+                if "xl/styles.xml" not in names:
+                    return
+                worksheet_paths = cls._worksheet_paths_by_title(source)
+                if not worksheet_paths:
+                    return
+
+                styles_root = ET.fromstring(source.read("xl/styles.xml"))
+                style_cache: dict[str, str] = {}
+                rewritten_worksheets: dict[str, bytes] = {}
+                for member_name in worksheet_paths.values():
+                    if member_name not in names:
+                        continue
+                    root = ET.fromstring(source.read(member_name))
+                    hyperlink_refs = cls._mature_product_hyperlink_refs(root)
+                    if not hyperlink_refs:
+                        continue
+                    if cls._apply_hyperlink_visual_styles(root, styles_root, style_cache, hyperlink_refs):
+                        rewritten_worksheets[member_name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+                if not rewritten_worksheets:
+                    return
+
+                updated_styles = ET.tostring(styles_root, encoding="utf-8", xml_declaration=True)
+                temp = tempfile.NamedTemporaryFile(delete=False, suffix=path.suffix or ".xlsx", dir=path.parent)
+                rewritten_path = Path(temp.name)
+                temp.close()
+                with ZipFile(rewritten_path, "w", ZIP_DEFLATED) as target:
+                    for item in source.infolist():
+                        data = source.read(item.filename)
+                        if item.filename == "xl/styles.xml":
+                            data = updated_styles
+                        elif item.filename in rewritten_worksheets:
+                            data = rewritten_worksheets[item.filename]
+                        target.writestr(item, data)
+            if rewritten_path is not None:
+                cls._replace_file_with_retry(rewritten_path, path)
+        except (BadZipFile, KeyError, ET.ParseError):
+            return
+        finally:
+            if rewritten_path is not None and rewritten_path.exists():
+                rewritten_path.unlink()
+
+    @classmethod
+    def _mature_product_hyperlink_refs(cls, worksheet_root: ET.Element) -> set[str]:
+        refs: set[str] = set()
+        hyperlink_parent = worksheet_root.find(f"{{{SPREADSHEET_NS}}}hyperlinks")
+        if hyperlink_parent is None:
+            return refs
+        for hyperlink in hyperlink_parent.findall(f"{{{SPREADSHEET_NS}}}hyperlink"):
+            refs.update(cls._expand_b_column_hyperlink_ref(hyperlink.attrib.get("ref", "")))
+        return refs
+
+    @staticmethod
+    def _expand_b_column_hyperlink_ref(ref: str) -> set[str]:
+        single = re.fullmatch(r"B(\d+)", ref or "")
+        if single:
+            row = int(single.group(1))
+            return {ref} if row >= 4 else set()
+        ranged = re.fullmatch(r"B(\d+):B(\d+)", ref or "")
+        if not ranged:
+            return set()
+        start, end = int(ranged.group(1)), int(ranged.group(2))
+        if start > end:
+            start, end = end, start
+        return {f"B{row}" for row in range(max(start, 4), end + 1)}
+
+    @classmethod
+    def _apply_hyperlink_visual_styles(
+        cls,
+        worksheet_root: ET.Element,
+        styles_root: ET.Element,
+        style_cache: dict[str, str],
+        refs: set[str],
+    ) -> bool:
+        changed = False
+        for row in worksheet_root.findall(f".//{{{SPREADSHEET_NS}}}sheetData/{{{SPREADSHEET_NS}}}row"):
+            for cell in row.findall(f"{{{SPREADSHEET_NS}}}c"):
+                ref = cell.attrib.get("r")
+                if ref not in refs:
+                    continue
+                base_style_id = cell.attrib.get("s", "0")
+                hyperlink_style_id = cls._hyperlink_visual_style_id(styles_root, style_cache, base_style_id)
+                if hyperlink_style_id is None:
+                    continue
+                if cell.attrib.get("s") != hyperlink_style_id:
+                    cell.attrib["s"] = hyperlink_style_id
+                    changed = True
+        return changed
+
+    @classmethod
+    def _hyperlink_visual_style_id(
+        cls,
+        styles_root: ET.Element,
+        style_cache: dict[str, str],
+        base_style_id: str,
+    ) -> str | None:
+        if base_style_id in style_cache:
+            return style_cache[base_style_id]
+        fonts = styles_root.find(f"{{{SPREADSHEET_NS}}}fonts")
+        cell_xfs = styles_root.find(f"{{{SPREADSHEET_NS}}}cellXfs")
+        if fonts is None or cell_xfs is None:
+            return None
+        xfs = list(cell_xfs)
+        try:
+            base_index = int(base_style_id)
+        except ValueError:
+            base_index = 0
+        if base_index < 0 or base_index >= len(xfs):
+            base_index = 0
+        base_xf = xfs[base_index]
+        font_id = cls._safe_int(base_xf.attrib.get("fontId"), 0)
+        font_nodes = list(fonts)
+        if font_id < 0 or font_id >= len(font_nodes):
+            font_id = 0
+        base_font = font_nodes[font_id] if font_nodes else ET.Element(f"{{{SPREADSHEET_NS}}}font")
+        if cls._font_has_hyperlink_visual(base_font):
+            style_cache[base_style_id] = str(base_index)
+            return str(base_index)
+
+        hyperlink_font = ET.fromstring(ET.tostring(base_font))
+        for child in list(hyperlink_font):
+            local_name = child.tag.rsplit("}", 1)[-1]
+            if local_name in {"color", "u"}:
+                hyperlink_font.remove(child)
+        ET.SubElement(hyperlink_font, f"{{{SPREADSHEET_NS}}}color", {"rgb": "FF0563C1"})
+        ET.SubElement(hyperlink_font, f"{{{SPREADSHEET_NS}}}u")
+        fonts.append(hyperlink_font)
+        new_font_id = len(fonts) - 1
+        fonts.attrib["count"] = str(len(fonts))
+
+        hyperlink_xf = ET.fromstring(ET.tostring(base_xf))
+        hyperlink_xf.attrib["fontId"] = str(new_font_id)
+        hyperlink_xf.attrib["applyFont"] = "1"
+        cell_xfs.append(hyperlink_xf)
+        new_style_id = len(cell_xfs) - 1
+        cell_xfs.attrib["count"] = str(len(cell_xfs))
+        style_cache[base_style_id] = str(new_style_id)
+        return str(new_style_id)
+
+    @staticmethod
+    def _safe_int(value: str | None, default: int) -> int:
+        try:
+            return int(value) if value is not None else default
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _font_has_hyperlink_visual(font: ET.Element) -> bool:
+        underline = font.find(f"{{{SPREADSHEET_NS}}}u")
+        if underline is None:
+            return False
+        underline_value = underline.attrib.get("val", "single")
+        if underline_value in {"none", "0", "false"}:
+            return False
+        color = font.find(f"{{{SPREADSHEET_NS}}}color")
+        if color is None:
+            return False
+        return color.attrib.get("rgb", "").upper().endswith("0563C1")
+
+    @classmethod
     def _restore_workbook_format_state(cls, path: Path, state: dict) -> None:
         if not state:
             return
@@ -628,7 +915,13 @@ class ExcelService:
                 }
                 if not worksheet_state_by_member and not state.get("styles"):
                     return
-                can_restore_styles = cls._can_restore_style_table(source, worksheet_state_by_member, state.get("styles"))
+                preserved_style_refs = cls._preserved_cell_style_refs(source, worksheet_state_by_member)
+                can_restore_styles = cls._can_restore_style_table(
+                    source,
+                    worksheet_state_by_member,
+                    state.get("styles"),
+                    preserved_style_refs,
+                )
                 temp = tempfile.NamedTemporaryFile(delete=False, suffix=path.suffix or ".xlsx", dir=path.parent)
                 rewritten_path = Path(temp.name)
                 temp.close()
@@ -642,6 +935,7 @@ class ExcelService:
                                 data,
                                 worksheet_state_by_member[item.filename],
                                 restore_cell_styles=can_restore_styles,
+                                preserve_style_refs=preserved_style_refs.get(item.filename, set()),
                             )
                         target.writestr(item, data)
             if rewritten_path is not None:
@@ -673,19 +967,49 @@ class ExcelService:
         }
 
     @classmethod
-    def _can_restore_style_table(cls, workbook_zip: ZipFile, worksheet_state_by_member: dict[str, dict], styles_xml: bytes | None) -> bool:
+    def _preserved_cell_style_refs(
+        cls,
+        workbook_zip: ZipFile,
+        worksheet_state_by_member: dict[str, dict],
+    ) -> dict[str, set[str]]:
+        preserved: dict[str, set[str]] = {}
+        for item in workbook_zip.infolist():
+            if not item.filename.startswith("xl/worksheets/") or not item.filename.endswith(".xml"):
+                continue
+            original_cell_styles = worksheet_state_by_member.get(item.filename, {}).get("cell_styles", {})
+            if not original_cell_styles:
+                continue
+            root = ET.fromstring(workbook_zip.read(item.filename))
+            for cell in root.findall(f".//{{{SPREADSHEET_NS}}}sheetData/{{{SPREADSHEET_NS}}}row/{{{SPREADSHEET_NS}}}c"):
+                ref = cell.attrib.get("r")
+                if ref not in original_cell_styles:
+                    continue
+                if cell.attrib.get("s") != original_cell_styles[ref]:
+                    preserved.setdefault(item.filename, set()).add(ref)
+        return preserved
+
+    @classmethod
+    def _can_restore_style_table(
+        cls,
+        workbook_zip: ZipFile,
+        worksheet_state_by_member: dict[str, dict],
+        styles_xml: bytes | None,
+        preserved_style_refs: dict[str, set[str]] | None = None,
+    ) -> bool:
         if not styles_xml:
             return False
+        preserved_style_refs = preserved_style_refs or {}
         style_count = cls._cell_style_count(styles_xml)
         for item in workbook_zip.infolist():
             if not item.filename.startswith("xl/worksheets/") or not item.filename.endswith(".xml"):
                 continue
             covered_cell_refs = worksheet_state_by_member.get(item.filename, {}).get("cell_styles", {})
+            member_preserved_refs = preserved_style_refs.get(item.filename, set())
             root = ET.fromstring(workbook_zip.read(item.filename))
             for cell in root.findall(f".//{{{SPREADSHEET_NS}}}sheetData/{{{SPREADSHEET_NS}}}row/{{{SPREADSHEET_NS}}}c"):
                 ref = cell.attrib.get("r")
                 style_id = cell.attrib.get("s")
-                if style_id is None or ref in covered_cell_refs:
+                if style_id is None or (ref in covered_cell_refs and ref not in member_preserved_refs):
                     continue
                 try:
                     if int(style_id) >= style_count:
@@ -706,9 +1030,16 @@ class ExcelService:
         return ET.tostring(element, encoding="utf-8") if element is not None else None
 
     @classmethod
-    def _apply_worksheet_format_state(cls, data: bytes, state: dict, restore_cell_styles: bool = True) -> bytes:
+    def _apply_worksheet_format_state(
+        cls,
+        data: bytes,
+        state: dict,
+        restore_cell_styles: bool = True,
+        preserve_style_refs: set[str] | None = None,
+    ) -> bytes:
         ET.register_namespace("", SPREADSHEET_NS)
         root = ET.fromstring(data)
+        preserve_style_refs = preserve_style_refs or set()
         for local_name, section_xml in state.get("sections", {}).items():
             cls._replace_worksheet_section(root, local_name, section_xml)
         row_attrs = state.get("row_attrs", {})
@@ -722,6 +1053,8 @@ class ExcelService:
                 continue
             for cell in row.findall(f"{{{SPREADSHEET_NS}}}c"):
                 ref = cell.attrib.get("r")
+                if ref in preserve_style_refs:
+                    continue
                 if ref not in cell_styles:
                     continue
                 style_id = cell_styles[ref]
@@ -730,14 +1063,21 @@ class ExcelService:
                 else:
                     cell.attrib["s"] = style_id
         if restore_cell_styles:
-            cls._restore_missing_style_only_cells(root, row_attrs, cell_styles)
+            cls._restore_missing_style_only_cells(root, row_attrs, cell_styles, preserve_style_refs)
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     @classmethod
-    def _restore_missing_style_only_cells(cls, root: ET.Element, row_attrs: dict, cell_styles: dict[str, str | None]) -> None:
+    def _restore_missing_style_only_cells(
+        cls,
+        root: ET.Element,
+        row_attrs: dict,
+        cell_styles: dict[str, str | None],
+        preserve_style_refs: set[str] | None = None,
+    ) -> None:
         sheet_data = root.find(f"{{{SPREADSHEET_NS}}}sheetData")
         if sheet_data is None:
             return
+        preserve_style_refs = preserve_style_refs or set()
         rows = {
             row.attrib.get("r"): row
             for row in sheet_data.findall(f"{{{SPREADSHEET_NS}}}row")
@@ -750,6 +1090,8 @@ class ExcelService:
             if cell.attrib.get("r")
         }
         for ref, style_id in cell_styles.items():
+            if ref in preserve_style_refs:
+                continue
             if style_id is None or ref in existing_refs:
                 continue
             row_id = cls._row_number_from_cell_ref(ref)

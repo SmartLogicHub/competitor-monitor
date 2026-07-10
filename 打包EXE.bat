@@ -5,6 +5,8 @@ cd /d "%~dp0"
 
 set "WEB_APP_NAME=CompetitorMonitorWeb"
 set "TASK_APP_NAME=CompetitorMonitorTaskRunner"
+set "PYTHONNOUSERSITE=1"
+set "PYTHONUSERBASE=%CD%\.py_user_base"
 
 where python >nul 2>nul
 if errorlevel 1 (
@@ -13,12 +15,16 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo Installing runtime dependencies...
-python -m pip install -r competitor_monitor\requirements.txt
+echo Checking runtime dependencies...
+python -c "import openpyxl, yaml, rebrowser_playwright" >nul 2>nul
 if errorlevel 1 (
-  echo Failed to install runtime dependencies.
-  pause
-  exit /b 1
+  echo Installing runtime dependencies...
+  python -m pip install -r competitor_monitor\requirements.txt
+  if errorlevel 1 (
+    echo Failed to install runtime dependencies.
+    pause
+    exit /b 1
+  )
 )
 
 python -m pip show pyinstaller >nul 2>nul
@@ -32,8 +38,15 @@ if errorlevel 1 (
   )
 )
 
+for /f "delims=" %%I in ('python -c "import pathlib, rebrowser_playwright; print(pathlib.Path(rebrowser_playwright.__file__).resolve().parent / 'driver')"') do set "REBROWSER_PLAYWRIGHT_DRIVER=%%I"
+if not exist "%REBROWSER_PLAYWRIGHT_DRIVER%\node.exe" (
+  echo rebrowser_playwright driver was not found: %REBROWSER_PLAYWRIGHT_DRIVER%
+  pause
+  exit /b 1
+)
+
 echo Building Web console exe...
-python -m PyInstaller --noconfirm --clean --onedir --name "%WEB_APP_NAME%" --paths "competitor_monitor" --add-data "web_frontend;web_frontend" --add-data "competitor_monitor\config.example.yaml;competitor_monitor" "competitor_monitor\web_server.py"
+python -m PyInstaller --noconfirm --clean --onedir --noconsole --name "%WEB_APP_NAME%" --paths "competitor_monitor" --add-data "web_frontend;web_frontend" --add-data "competitor_monitor\config.example.yaml;competitor_monitor" --add-data "%REBROWSER_PLAYWRIGHT_DRIVER%;rebrowser_playwright\driver" "competitor_monitor\web_server.py"
 if errorlevel 1 (
   echo Web console build failed.
   pause
@@ -41,7 +54,7 @@ if errorlevel 1 (
 )
 
 echo Building background task runner exe...
-python -m PyInstaller --noconfirm --clean --onedir --name "%TASK_APP_NAME%" --paths "competitor_monitor" --add-data "competitor_monitor\config.example.yaml;competitor_monitor" "competitor_monitor\run_web_task.py"
+python -m PyInstaller --noconfirm --clean --onedir --noconsole --name "%TASK_APP_NAME%" --paths "competitor_monitor" --add-data "competitor_monitor\config.example.yaml;competitor_monitor" --add-data "%REBROWSER_PLAYWRIGHT_DRIVER%;rebrowser_playwright\driver" "competitor_monitor\run_web_task.py"
 if errorlevel 1 (
   echo Task runner build failed.
   pause

@@ -10,6 +10,21 @@ class ProductCollectorTest(unittest.TestCase):
         activity = ActivityService({"国补": ["政府补贴"], "超级立减": ["超级立减"]})
         self.collector = ProductCollector(activity)
 
+    def test_page_model_presence_allows_separated_chinese_descriptor(self):
+        visible_text = (
+            "\u6c34\u6708\u96e8\u7fbd\u7ffc Edge ANC "
+            "\u4e3b\u52a8\u964d\u566aHiFi\u97f3\u8d28\u771f\u65e0\u7ebf"
+            "\u5934\u6234\u5f0f\u84dd\u72595.4\u8033\u673a "
+            "\u5e97\u94fa\u4f18\u60e0\u540e \uffe5399"
+        )
+
+        missing = ProductCollector.page_misses_required_model_tokens(
+            "\u7fbd\u7ffc\u5934\u6234\u5f0f",
+            visible_text,
+        )
+
+        self.assertFalse(missing)
+
     def test_extracts_platform_subsidy_price_first(self):
         text = "页面主价格 ￥399 平台加补后 ￥268.52 起 到手价 ￥288"
 
@@ -92,6 +107,30 @@ class ProductCollectorTest(unittest.TestCase):
 
         self.assertEqual(snapshot.price, "268.52")
         self.assertEqual(page.clicked_options, [])
+
+    def test_click_path_selects_standard_package_before_model_option(self):
+        page = FakePackageSkuPage(
+            package_options={
+                "\u5b98\u65b9\u6807\u914d \u5168\u7403TOP1": {
+                    "Pro2\u661f\u82a5\u7d2b | \u5343\u5143\u7ea7\u4e8c\u4ee3\u94db\u52a8\u5708": "268.52",
+                    "Pro2\u65e0\u5c3d\u9ed1 | \u5343\u5143\u7ea7\u4e8c\u4ee3\u94db\u52a8\u5708": "268.52",
+                },
+                "\u5957\u9910\u4e00 \u661f\u8ff9\u94bb\u6263": {
+                    "Pro2\u661f\u82a5\u7d2b | \u5343\u5143\u7ea7\u4e8c\u4ee3\u94db\u52a8\u5708": "308.52",
+                    "Pro2\u65e0\u5c3d\u9ed1 | \u5343\u5143\u7ea7\u4e8c\u4ee3\u94db\u52a8\u5708": "308.52",
+                },
+            },
+            default_package="\u5957\u9910\u4e00 \u661f\u8ff9\u94bb\u6263",
+            base_text="S6S proII",
+        )
+
+        snapshot = self.collector.collect_from_page(page, expected_model="S6S proII")
+
+        self.assertEqual(snapshot.price, "268.52")
+        self.assertEqual(
+            page.clicked_options[:1],
+            ["\u5b98\u65b9\u6807\u914d \u5168\u7403TOP1"],
+        )
 
     def test_initial_sku_data_filters_ultra_art_and_recommendation_for_ultra_model(self):
         page = FakeInitialDataPage(
@@ -301,6 +340,23 @@ class FakeInitialDataPage(FakeSkuPage):
         return self.html
 
 
+class FakePackageSkuPage:
+    def __init__(self, package_options, default_package, base_text=""):
+        self.package_options = package_options
+        self.base_text = base_text
+        self.selected_package = default_package
+        self.selected_option = None
+        self.clicked_options = []
+
+    def locator(self, selector):
+        if selector != "body":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return FakePackageBodyLocator(self)
+
+    def get_by_text(self, text, exact=True):
+        return FakePackageTextLocator(self, text)
+
+
 class FakeBodyLocator:
     def __init__(self, page):
         self.page = page
@@ -315,6 +371,25 @@ class FakeBodyLocator:
         return list(self.page.option_prices)
 
 
+class FakePackageBodyLocator:
+    def __init__(self, page):
+        self.page = page
+
+    def inner_text(self, timeout=5000):
+        if self.page.selected_option is None:
+            return self.page.base_text
+        price = self.page.package_options[self.page.selected_package][self.page.selected_option]
+        return f"{self.page.base_text} \u5e73\u53f0\u52a0\u8865\u540e \uffe5{price} \u8d77"
+
+    def evaluate(self, script):
+        product_options = []
+        for option_prices in self.page.package_options.values():
+            for option in option_prices:
+                if option not in product_options:
+                    product_options.append(option)
+        return [*self.page.package_options.keys(), *product_options]
+
+
 class FakeTextLocator:
     def __init__(self, page, text):
         self.page = page
@@ -326,6 +401,15 @@ class FakeTextLocator:
 
     def click(self, timeout=5000):
         self.page.selected_option = self.text
+        self.page.clicked_options.append(self.text)
+
+
+class FakePackageTextLocator(FakeTextLocator):
+    def click(self, timeout=5000):
+        if self.text in self.page.package_options:
+            self.page.selected_package = self.text
+        else:
+            self.page.selected_option = self.text
         self.page.clicked_options.append(self.text)
 
 

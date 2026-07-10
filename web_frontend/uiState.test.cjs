@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { buildAutomationView, statusTone, statusText } = require("./uiState.js");
+const { buildAutomationView, statusTone, statusText, isLiveStatus, activeTaskId } = require("./uiState.js");
 
 const baseTasks = {
   system_status: "idle",
@@ -60,4 +60,19 @@ test("status helpers expose the shared feedback language", () => {
   assert.equal(statusTone("running"), "active");
   assert.equal(statusTone("template_error"), "danger");
   assert.equal(statusText("sending"), "推送中");
+});
+
+test("live status helper treats every backend active state as running", () => {
+  assert.equal(isLiveStatus("running"), true);
+  assert.equal(isLiveStatus("backfilling"), true);
+  assert.equal(isLiveStatus("saving"), true);
+  assert.equal(isLiveStatus("sending"), true);
+  assert.equal(isLiveStatus("idle"), false);
+  assert.equal(isLiveStatus("success"), false);
+});
+
+test("active task helper keeps scheduled runner visible in the matching card", () => {
+  assert.equal(activeTaskId({ system_status: "running", active_mode: "daily_price" }), "daily_price");
+  assert.equal(activeTaskId({ system_status: "sending", active_mode: "weekly_new" }), "weekly_new");
+  assert.equal(activeTaskId({ system_status: "idle", active_mode: "daily_price" }), null);
 });

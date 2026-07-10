@@ -1,6 +1,7 @@
 import sys
 import json
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -71,6 +72,30 @@ class BrowserServiceConfigTest(unittest.TestCase):
         uniform.assert_called_once_with(2, 8)
         sleep.assert_called_once_with(3.5)
         self.assertEqual(actual, 3.5)
+
+    def test_wait_after_operation_can_be_interrupted_by_stop_request(self):
+        stop_event = threading.Event()
+        service = BrowserService(
+            headless=True,
+            timeout_ms=1000,
+            context_config={
+                "operation_min_delay_seconds": 3,
+                "operation_max_delay_seconds": 3,
+            },
+            stop_event=stop_event,
+        )
+
+        def request_stop(_seconds):
+            stop_event.set()
+
+        with patch("browser_service.random.uniform", return_value=3.0):
+            with patch("browser_service.time.sleep", side_effect=request_stop) as sleep:
+                actual = service.wait_after_operation()
+
+        self.assertEqual(actual, 3.0)
+        sleep.assert_called_once()
+        self.assertLess(sleep.call_args.args[0], 3.0)
+        self.assertTrue(stop_event.is_set())
 
     def test_persistent_context_receives_launch_and_context_options(self):
         fake_module = types.ModuleType("rebrowser_playwright.sync_api")
@@ -249,7 +274,7 @@ class BrowserServiceConfigTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(delays), 4)
 
-    def test_taobao_auto_login_does_not_repeat_submit_while_manual_login_is_pending(self):
+    def test_taobao_auto_login_retries_once_when_verification_returns_to_login_page(self):
         page = FakeNewTaobaoPasswordLoginPage()
         page.stay_login_required_after_submit = True
         service = BrowserService(
@@ -264,9 +289,57 @@ class BrowserServiceConfigTest(unittest.TestCase):
         service.login_taobao(page, AccountCredentials(username="user1", password="pass1"))
         service.login_taobao(page, AccountCredentials(username="user1", password="pass1"))
 
-        self.assertEqual(page.clicked_selectors.count("button.fm-submit"), 1)
-        self.assertEqual(page.clicked_selectors.count("#fm-agreement-checkbox"), 1)
+        self.assertEqual(page.clicked_selectors.count("button.fm-submit"), 2)
+        self.assertEqual(page.clicked_selectors.count("#fm-agreement-checkbox"), 2)
+        self.assertEqual(page.filled["input[placeholder*='账号名']"], "user1")
+        self.assertEqual(page.filled["input[placeholder*='登录密码']"], "pass1")
         self.assertEqual(len(pause_messages), 2)
+
+    def test_taobao_auto_login_caps_retries_when_login_page_keeps_returning(self):
+        page = FakeNewTaobaoPasswordLoginPage()
+        page.stay_login_required_after_submit = True
+        service = BrowserService(
+            headless=True,
+            timeout_ms=1000,
+            context_config={
+                "operation_min_delay_seconds": 0,
+                "operation_max_delay_seconds": 0,
+                "taobao_auto_login_max_attempts": 2,
+            },
+        )
+        service.wait_after_operation = lambda: 0
+        pause_messages = []
+        service._pause_for_manual_action = lambda _page, message: pause_messages.append(message) or PageAuthState.LOGIN_REQUIRED
+
+        service.login_taobao(page, AccountCredentials(username="user1", password="pass1"))
+        service.login_taobao(page, AccountCredentials(username="user1", password="pass1"))
+        service.login_taobao(page, AccountCredentials(username="user1", password="pass1"))
+
+        self.assertEqual(page.clicked_selectors.count("button.fm-submit"), 2)
+        self.assertEqual(page.clicked_selectors.count("#fm-agreement-checkbox"), 2)
+        self.assertEqual(len(pause_messages), 3)
+
+    def test_manual_verification_can_return_to_login_page_for_second_auto_login_attempt(self):
+        page = FakeVerificationReturnsToLoginPage()
+        service = BrowserService(
+            headless=True,
+            timeout_ms=1000,
+            context_config={
+                "operation_min_delay_seconds": 0,
+                "operation_max_delay_seconds": 0,
+                "manual_action_timeout_seconds": 1,
+                "manual_action_poll_seconds": 0,
+            },
+            taobao_credentials=AccountCredentials(username="user1", password="pass1"),
+        )
+        service.wait_after_operation = lambda: 0
+
+        state = service.login_taobao(page, AccountCredentials(username="user1", password="pass1"))
+
+        self.assertEqual(state, PageAuthState.AUTHENTICATED)
+        self.assertEqual(page.clicked_selectors.count("button.fm-submit"), 2)
+        self.assertEqual(page.filled["input[placeholder*='账号名']"], "user1")
+        self.assertEqual(page.filled["input[placeholder*='登录密码']"], "pass1")
 
     def test_recover_page_auth_waits_for_persistent_profile_before_auto_login(self):
         page = FakeDelayedProfileAuthPage()
@@ -414,6 +487,28 @@ class BrowserServiceConfigTest(unittest.TestCase):
 
         self.assertTrue(page.resolved)
 
+    def test_manual_action_wait_stops_when_task_stop_is_requested(self):
+        page = FakePassportVerificationPage()
+        stop_event = threading.Event()
+        service = BrowserService(
+            headless=True,
+            timeout_ms=1000,
+            context_config={
+                "manual_action_timeout_seconds": 1,
+                "manual_action_poll_seconds": 0,
+            },
+            stop_event=stop_event,
+        )
+
+        def request_stop(_seconds):
+            stop_event.set()
+
+        with patch("browser_service.time.sleep", side_effect=request_stop):
+            state = service._pause_for_manual_action(page, "需要人工处理")
+
+        self.assertEqual(state, PageAuthState.MANUAL_ACTION_REQUIRED)
+        self.assertTrue(stop_event.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -554,6 +649,30 @@ class FakeNewTaobaoPasswordLoginPage(FakeTaobaoLoginPage):
         return FakeMissingLocator(selector)
 
 
+class FakeVerificationReturnsToLoginPage(FakeNewTaobaoPasswordLoginPage):
+    def __init__(self):
+        super().__init__()
+        self.state_after_submit = "manual"
+        self.manual_polls = 0
+
+    def wait_for_load_state(self, state, timeout=0):
+        if self.state_after_submit == "manual":
+            self.manual_polls += 1
+            if self.manual_polls >= 2:
+                self.state_after_submit = "login"
+                self.url = "https://login.taobao.com/member/login.jhtml"
+                self.body = "密码登录 短信登录 账号名/邮箱/手机号 请输入登录密码 已阅读并同意以下协议 登录"
+        return None
+
+    def mark_submitted(self):
+        if self.state_after_submit == "manual":
+            self.url = "https://passport.taobao.com/ac/h5/verify"
+            self.body = "手机验证 请输入验证码"
+        elif self.state_after_submit == "login":
+            self.url = "https://www.taobao.com/"
+            self.body = "tb39655791 淘宝网首页"
+
+
 class FakeManualResolutionPage(FakeTextPage):
     def __init__(self):
         super().__init__("https://login.taobao.com/member/login.jhtml", "登录", "账号 密码 登录")
@@ -635,6 +754,9 @@ class FakeLoginLocator:
 
     def click(self, timeout=0):
         self.page.clicked_selectors.append(self.selector)
+        if self.selector in {"button[type='submit']", "button.fm-submit"} and hasattr(self.page, "mark_submitted"):
+            self.page.mark_submitted()
+            return
         if self.selector in {"button[type='submit']", "button.fm-submit"} and not getattr(
             self.page, "stay_login_required_after_submit", False
         ):

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+import shutil
 from copy import copy
 from datetime import date
 from pathlib import Path
@@ -8,8 +9,9 @@ from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Border, Side
 
-from excel_service import ExcelService, WorkbookLayoutError, backup_excel
+from excel_service import ExcelService, WorkbookLayoutError, WorkbookLockedError, backup_excel
 
 
 def create_sample_workbook(path: Path) -> None:
@@ -217,6 +219,34 @@ class ExcelServiceTest(unittest.TestCase):
 
             self.assertEqual(excel_path.read_bytes(), b"original workbook bytes")
 
+    def test_save_workbook_uses_fallback_when_target_is_locked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            excel_path = Path(tmpdir) / "monitor.xlsx"
+            fallback_path = Path(tmpdir) / "output" / "latest" / "monitor.xlsx"
+            excel_path.write_bytes(b"original workbook bytes")
+            fallback_calls = []
+
+            def fallback(temp_path, target_path, error):
+                fallback_path.parent.mkdir(parents=True)
+                shutil.copy2(temp_path, fallback_path)
+                fallback_calls.append((Path(target_path), str(error)))
+                return fallback_path
+
+            service = ExcelService(excel_path, save_fallback=fallback)
+            with patch.object(
+                ExcelService,
+                "_replace_file_with_retry",
+                side_effect=WorkbookLockedError("locked"),
+            ) as replace_mock:
+                actual_path = service.save_workbook(ByteWorkbook(b"updated workbook bytes"), excel_path)
+
+            self.assertEqual(actual_path, fallback_path)
+            self.assertEqual(service.excel_path, fallback_path)
+            self.assertEqual(excel_path.read_bytes(), b"original workbook bytes")
+            self.assertEqual(fallback_path.read_bytes(), b"updated workbook bytes")
+            self.assertEqual(fallback_calls[0][0], excel_path)
+            self.assertEqual(replace_mock.call_args.kwargs["attempts"], 3)
+
     def test_save_workbook_preserves_empty_sheet_tab_color_nodes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             excel_path = Path(tmpdir) / "monitor.xlsx"
@@ -239,6 +269,10 @@ class ExcelServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             excel_path = Path(tmpdir) / "monitor.xlsx"
             create_sample_workbook(excel_path)
+            wb = load_workbook(excel_path)
+            wb["6.29-7.3"]["B4"].hyperlink = None
+            wb["6.29-7.3"]["B5"].hyperlink = None
+            wb.save(excel_path)
             original_styles = read_xlsx_member(excel_path, "xl/styles.xml")
             service = ExcelService(excel_path)
             wb = service.load_workbook()
@@ -248,6 +282,57 @@ class ExcelServiceTest(unittest.TestCase):
 
             self.assertEqual(read_xlsx_member(excel_path, "xl/styles.xml"), original_styles)
             self.assertEqual(load_workbook(excel_path)["6.29-7.3"]["C4"].value, "changed")
+
+    def test_save_workbook_preserves_style_changes_on_changed_existing_cells(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            excel_path = Path(tmpdir) / "monitor.xlsx"
+            create_sample_workbook(excel_path)
+            wb = load_workbook(excel_path)
+            ws = wb["6.29-7.3"]
+            thin = Side(style="thin")
+            ws["K4"].border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            wb.save(excel_path)
+
+            service = ExcelService(excel_path)
+            wb = service.load_workbook()
+            ws = wb["6.29-7.3"]
+            cell = ws["K4"]
+            original_border = copy(cell.border)
+            cell.value = "H9"
+            cell.hyperlink = "https://example.com/h9"
+            font = copy(cell.font)
+            font.color = "0563C1"
+            font.underline = "single"
+            cell.font = font
+
+            service.save_workbook(wb, excel_path)
+
+            saved_cell = load_workbook(excel_path)["6.29-7.3"]["K4"]
+            self.assertEqual(saved_cell.value, "H9")
+            self.assertEqual(saved_cell.hyperlink.target, "https://example.com/h9")
+            self.assertEqual(saved_cell.font.underline, "single")
+            self.assertEqual(saved_cell.font.color.rgb, "000563C1")
+            self.assertEqual(saved_cell.border.top.style, original_border.top.style)
+
+    def test_save_workbook_styles_mature_product_hyperlinks_without_losing_borders(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            excel_path = Path(tmpdir) / "monitor.xlsx"
+            create_sample_workbook(excel_path)
+            service = ExcelService(excel_path)
+            wb = service.load_workbook()
+            ws = wb["6.29-7.3"]
+            original_border = copy(ws["B4"].border)
+
+            ws["C4"] = "changed"
+            service.save_workbook(wb, excel_path)
+
+            saved_cell = load_workbook(excel_path)["6.29-7.3"]["B4"]
+            self.assertEqual(saved_cell.hyperlink.target, "https://detail.tmall.com/item.htm?id=800417757444")
+            self.assertEqual(saved_cell.font.underline, "single")
+            self.assertIn(saved_cell.font.color.rgb, {"000563C1", "FF0563C1"})
+            self.assertEqual(saved_cell.border.left.style, original_border.left.style)
+            self.assertEqual(saved_cell.border.top.style, original_border.top.style)
+            self.assertEqual(saved_cell.border.bottom.style, original_border.bottom.style)
 
     def test_save_workbook_preserves_existing_drawing_package_parts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -281,7 +366,7 @@ class ExcelServiceTest(unittest.TestCase):
             attempts = {"count": 0}
 
             def flaky_replace(path, destination):
-                if path == source and attempts["count"] == 0:
+                if path == source and attempts["count"] < 6:
                     attempts["count"] += 1
                     raise PermissionError("simulated transient lock")
                 return original_replace(path, destination)
@@ -290,13 +375,75 @@ class ExcelServiceTest(unittest.TestCase):
                 ExcelService._replace_file_with_retry(source, target)
 
             self.assertEqual(target.read_text(encoding="utf-8"), "new")
-            self.assertEqual(attempts["count"], 1)
+            self.assertEqual(attempts["count"], 6)
+
+    def test_assert_workbook_writable_reports_locked_excel_clearly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            excel_path = Path(tmpdir) / "monitor.xlsx"
+            excel_path.write_bytes(b"workbook bytes")
+
+            with patch.object(ExcelService, "_open_file_exclusive", side_effect=PermissionError("locked")):
+                with self.assertRaises(WorkbookLockedError) as ctx:
+                    ExcelService.assert_workbook_writable(excel_path)
+
+            self.assertIn("当前 Excel 文件被占用", str(ctx.exception))
+            self.assertIn("Excel/WPS", str(ctx.exception))
+
+    def test_wait_workbook_writable_retries_until_transient_lock_is_released(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            excel_path = Path(tmpdir) / "monitor.xlsx"
+            excel_path.write_bytes(b"workbook bytes")
+            calls = {"count": 0}
+            sleeps: list[float] = []
+            wait_events: list[tuple[int, int]] = []
+
+            def flaky_check(path):
+                calls["count"] += 1
+                if calls["count"] <= 3:
+                    raise WorkbookLockedError("simulated transient lock")
+
+            with patch.object(ExcelService, "assert_workbook_writable", flaky_check), patch(
+                "excel_service.time.sleep", lambda seconds: sleeps.append(seconds)
+            ):
+                ExcelService.wait_workbook_writable(
+                    excel_path,
+                    timeout_seconds=5,
+                    delay_seconds=1,
+                    on_wait=lambda attempt, remaining: wait_events.append((attempt, remaining)),
+                )
+
+            self.assertEqual(calls["count"], 4)
+            self.assertEqual(sleeps, [1, 1, 1])
+            self.assertEqual([event[0] for event in wait_events], [1, 2, 3])
+
+    def test_wait_workbook_writable_raises_clear_error_after_timeout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            excel_path = Path(tmpdir) / "monitor.xlsx"
+            excel_path.write_bytes(b"workbook bytes")
+
+            with patch.object(
+                ExcelService,
+                "assert_workbook_writable",
+                side_effect=WorkbookLockedError("当前 Excel 文件被占用，请关闭 Excel/WPS/预览窗口后再运行：monitor.xlsx"),
+            ), patch("excel_service.time.sleep", lambda _seconds: None):
+                with self.assertRaises(WorkbookLockedError) as ctx:
+                    ExcelService.wait_workbook_writable(excel_path, timeout_seconds=2, delay_seconds=1)
+
+            self.assertIn("当前 Excel 文件被占用", str(ctx.exception))
 
 
 class FailingWorkbook:
     def save(self, target):
         Path(target).write_bytes(b"partial workbook bytes")
         raise RuntimeError("simulated save failure")
+
+
+class ByteWorkbook:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    def save(self, target):
+        Path(target).write_bytes(self.payload)
 
 
 def rewrite_xlsx_member(path: Path, member_name: str, transform):

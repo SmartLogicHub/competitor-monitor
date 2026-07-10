@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import json
 import random
 import re
 import sys
@@ -173,6 +174,17 @@ def run_daily_price_job(
     logger.info("Products in this run: %s", len(display_products))
     if row_filter:
         logger.info("Requested Excel rows: %s", ",".join(str(row) for row in sorted(row_filter)))
+    if progress_callback:
+        progress_callback(
+            {
+                "event": "phase",
+                "processed": 0,
+                "total": len(display_products),
+                "status": "startup",
+                "step": f"已识别 {len(display_products)} 条商品，正在准备采集",
+                "sheet": worksheet.title,
+            }
+        )
 
     print_product_list(display_products)
     if dry_run:
@@ -577,15 +589,45 @@ def run_collection(
             }
         )
 
+    def emit_phase(step: str) -> None:
+        if not progress_callback:
+            return
+        progress_callback(
+            {
+                "event": "phase",
+                "processed": stats.success + stats.failed + stats.skipped,
+                "total": stats.total,
+                "status": "startup",
+                "step": step,
+                "sheet": worksheet.title,
+            }
+        )
+
+    if stop_event is not None and stop_event.is_set():
+        logger.warning("Stop requested before browser startup; collection skipped")
+        return stats
+
+    emit_phase(f"已识别 {stats.total} 条商品，正在启动浏览器并检查淘宝登录")
+
     with BrowserService(
         headless=bool(config.get("headless", False)),
         timeout_ms=int(config.get("timeout_ms", 30000)),
         user_data_dir=config.get("browser_user_data_dir", "competitor_monitor/browser_profile"),
         context_config=config,
         taobao_credentials=load_taobao_credentials(config),
+        stop_event=stop_event,
     ) as browser:
         if bool(config.get("taobao_login_check_enabled", True)):
-            browser.ensure_taobao_login()
+            if has_saved_taobao_auth_state(config):
+                logger.info("Saved Taobao login state exists; startup login check skipped")
+                emit_phase("已检测到本地登录状态，直接进入商品页检查")
+            else:
+                emit_phase("正在确认淘宝登录状态")
+                browser.ensure_taobao_login()
+        if stop_event is not None and stop_event.is_set():
+            logger.warning("Stop requested after browser login; collection skipped")
+            return stats
+        emit_phase(f"登录状态已确认，准备处理第 1/{stats.total} 条商品")
         for processed_count, product in enumerate(target_products, start=1):
             if stop_event is not None and stop_event.is_set():
                 logger.warning("Stop requested; collection halted before row=%s product=%s", product.row, product.name)
@@ -723,7 +765,7 @@ def run_collection(
                     force_overwrite=force_overwrite,
                 )
                 if price_to_write is None and not skip_price:
-                    logger.warning("浠锋牸閲囬泦澶辫触锛歴heet=%s row=%s 鍟嗗搧=%s 閾炬帴=%s", worksheet.title, product.row, product.name, product.url)
+                    logger.warning("价格采集失败：sheet=%s row=%s 商品=%s 链接=%s", worksheet.title, product.row, product.name, product.url)
                     stats.failed += 1
                     emit_progress(processed_count, product, "failed", error="price_not_collected")
                 else:
@@ -731,18 +773,26 @@ def run_collection(
                     if skip_price and not wrote_price:
                         stats.skipped += 1
                     emit_progress(processed_count, product, "success", price=price_to_write, warning=progress_warning)
+                if stop_event is not None and stop_event.is_set():
+                    logger.warning("Stop requested after row=%s product=%s; stopping without delay", product.row, product.name)
+                    break
                 time.sleep(random.randint(min_delay, max_delay))
             except Exception as exc:
                 stats.failed += 1
-                logger.exception("閲囬泦澶辫触锛歴heet=%s row=%s 鍟嗗搧=%s 閾炬帴=%s 鍘熷洜=%s", worksheet.title, product.row, product.name, product.url, exc)
+                logger.exception("采集失败：sheet=%s row=%s 商品=%s 链接=%s 原因=%s", worksheet.title, product.row, product.name, product.url, exc)
                 emit_progress(processed_count, product, "failed", error=str(exc))
             if excel_path and should_save_checkpoint(processed_count, save_every):
+                emit_phase(f"正在保存第 {processed_count}/{stats.total} 条后的 Excel 检查点")
                 excel.save_workbook(workbook, excel_path)
                 saved_current_state = True
                 if target_date is not None and processed_count < stats.total:
                     workbook, worksheet, layout = reload_workbook_state(excel, workbook, worksheet, target_date)
                 logger.info("Processed %s products and saved Excel checkpoint: %s", processed_count, excel_path)
     if excel_path and not saved_current_state:
+        if stop_event is not None and stop_event.is_set():
+            emit_phase("已停止采集，正在保存已完成结果")
+        else:
+            emit_phase("正在保存 Excel")
         excel.save_workbook(workbook, excel_path)
         logger.info("Saved Excel: %s", excel_path)
     return stats
@@ -806,6 +856,33 @@ def should_save_checkpoint(processed_count: int, save_every: int | None) -> bool
     if not save_every or save_every <= 0:
         return False
     return processed_count > 0 and processed_count % save_every == 0
+
+
+def has_saved_taobao_auth_state(config) -> bool:
+    if not bool(config.get("taobao_skip_startup_login_check_when_storage_exists", True)):
+        return False
+    raw_path = config.get("browser_storage_state_path")
+    if not raw_path:
+        return False
+    path = Path(raw_path)
+    try:
+        if not path.exists() or path.stat().st_size <= 0:
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    cookies = payload.get("cookies")
+    if not isinstance(cookies, list):
+        return False
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        domain = str(cookie.get("domain") or "").lower()
+        if "taobao.com" in domain or "tmall.com" in domain:
+            return True
+    return False
 
 
 def previous_price_cells_are_all_slash(worksheet, layout, row: int) -> bool:

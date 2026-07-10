@@ -3,6 +3,7 @@ from copy import copy
 from datetime import date
 
 from openpyxl import Workbook
+from openpyxl.styles import Border, Side
 
 from new_product_service import NewProduct
 from new_product_writer import (
@@ -126,7 +127,7 @@ class NewProductWriterTest(unittest.TestCase):
         self.assertEqual(stats.skipped_duplicates, 1)
         self.assertEqual(ws["K5"].value, None)
 
-    def test_records_failure_when_brand_area_has_no_empty_row(self):
+    def test_expands_brand_area_when_no_empty_new_product_row_exists(self):
         wb = Workbook()
         ws = wb.active
         ws["J1"] = "上新监控"
@@ -144,8 +145,26 @@ class NewProductWriterTest(unittest.TestCase):
         ws["S2"] = "新卖点"
         ws.merge_cells("S2:S3")
         ws["A4"] = "索尼影音"
-        ws.merge_cells("A4:A4")
-        ws["K4"] = "existing"
+        ws.merge_cells("A4:A5")
+        ws["B4"] = "sony-left-4"
+        ws["B5"] = "sony-left-5"
+        ws["K4"] = "existing-1"
+        ws["K5"] = "existing-2"
+        ws["A6"] = "华为"
+        ws.merge_cells("A6:A7")
+        ws["B6"] = "huawei-left-6"
+        ws["B6"].hyperlink = "https://example.com/huawei-left-6"
+        ws["B7"] = "huawei-left-7"
+        ws.merge_cells("J6:S7")
+        ws["J6"] = "无上新"
+        ws["K5"].style = "Hyperlink"
+        thin = Side(style="thin")
+        ws["K5"].border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        original_following_brand_merges = {
+            str(rng)
+            for rng in ws.merged_cells.ranges
+            if rng.min_col <= 1 <= rng.max_col and rng.min_row >= 6
+        }
         layout = detect_new_product_layout(ws)
         product = NewProduct(
             brand="索尼影音",
@@ -161,10 +180,182 @@ class NewProductWriterTest(unittest.TestCase):
 
         stats = write_new_products(ws, layout, {"索尼影音": [product]}, no_data_text="无上新")
 
-        self.assertEqual(stats.failed, 1)
-        self.assertIn("索尼影音", stats.failure_details[0])
-        self.assertIn("H9", stats.failure_details[0])
-        self.assertIn("没有空行", stats.failure_details[0])
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.written, 1)
+        self.assertEqual(stats.failure_details, ())
+        self.assertEqual(ws["K6"].value, "H9")
+        self.assertEqual(ws["K6"].hyperlink.target, "https://example.com/h9")
+        self.assertEqual(ws["A4"].value, "索尼影音")
+        self.assertIn("A4:A5", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertEqual(ws["B4"].value, "sony-left-4")
+        self.assertEqual(ws["B5"].value, "sony-left-5")
+        self.assertEqual(ws["A6"].value, "华为")
+        self.assertIn("A6:A7", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertEqual(ws["B6"].value, "huawei-left-6")
+        self.assertEqual(ws["B6"].hyperlink.target, "https://example.com/huawei-left-6")
+        self.assertEqual(ws["B7"].value, "huawei-left-7")
+        self.assertEqual(
+            {
+                str(rng)
+                for rng in ws.merged_cells.ranges
+                if rng.min_col <= 1 <= rng.max_col and rng.min_row >= 6
+            },
+            original_following_brand_merges,
+        )
+        self.assertIn("J7:S7", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertEqual(ws["J7"].value, "无上新")
+        self.assertFalse(
+            any(
+                rng.min_row <= 6 <= rng.max_row and rng.min_col <= 10 and rng.max_col >= 19
+                for rng in ws.merged_cells.ranges
+            )
+        )
+        self.assertEqual(ws["K6"].style, "Hyperlink")
+        self.assertEqual(ws["K6"].border.top.style, "thin")
+        self.assertEqual(ws["K6"].border.bottom.style, "thin")
+
+        duplicate_stats = write_new_products(ws, layout, {"索尼影音": [product]}, no_data_text="无上新")
+
+        self.assertEqual(duplicate_stats.skipped_duplicates, 1)
+        self.assertEqual(ws["K6"].value, "H9")
+        self.assertEqual(ws["K7"].value, None)
+        self.assertIn("J7:S7", {str(rng) for rng in ws.merged_cells.ranges})
+
+    def test_right_side_expansion_keeps_following_brand_ranges_shifted(self):
+        wb = Workbook()
+        ws = wb.active
+        ws["J1"] = "上新监控"
+        ws.merge_cells("J1:S1")
+        ws["J2"] = "上架日期"
+        ws.merge_cells("J2:J3")
+        ws["K2"] = "型号"
+        ws.merge_cells("K2:K3")
+        ws["L2"] = "形态"
+        ws.merge_cells("L2:L3")
+        ws["M2"] = "价格"
+        ws.merge_cells("M2:M3")
+        ws["N2"] = "直播价格"
+        ws.merge_cells("N2:R2")
+        ws["S2"] = "新卖点"
+        ws.merge_cells("S2:S3")
+        ws["A4"] = "索尼影音"
+        ws.merge_cells("A4:A5")
+        ws["K4"] = "existing-1"
+        ws["K5"] = "existing-2"
+        ws["A6"] = "绿联"
+        ws.merge_cells("A6:A7")
+        ws.merge_cells("J6:S7")
+        ws["J6"] = "无上新"
+        ws["A8"] = "华为"
+        ws.merge_cells("A8:A9")
+        ws.merge_cells("J8:S9")
+        ws["J8"] = "无上新"
+        ws["A10"] = "小米"
+        ws.merge_cells("A10:A11")
+        layout = detect_new_product_layout(ws)
+
+        stats = write_new_products(
+            ws,
+            layout,
+            {
+                "索尼影音": [
+                    NewProduct(
+                        brand="索尼影音",
+                        on_sale_date=date(2026, 7, 3),
+                        model="H9",
+                        shape="头戴式",
+                        price="1969",
+                        link="https://example.com/h9",
+                        selling_point="/",
+                        source_id="h9",
+                        raw_name="Sony H9",
+                    )
+                ],
+                "小米": [
+                    NewProduct(
+                        brand="小米",
+                        on_sale_date=date(2026, 7, 2),
+                        model="Buds8",
+                        shape="未知",
+                        price="139",
+                        link="https://example.com/buds8",
+                        selling_point="/",
+                        source_id="buds8",
+                        raw_name="Xiaomi Buds8",
+                    )
+                ],
+            },
+            no_data_text="无上新",
+        )
+
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.written, 2)
+        self.assertEqual(ws["K6"].value, "H9")
+        self.assertIn("J7:S7", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertIn("J8:S9", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertEqual(ws["K10"].value, "Buds8")
+        self.assertEqual(ws["A6"].value, "绿联")
+        self.assertIn("A6:A7", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertEqual(ws["A8"].value, "华为")
+        self.assertIn("A8:A9", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertEqual(ws["A10"].value, "小米")
+        self.assertIn("A10:A11", {str(rng) for rng in ws.merged_cells.ranges})
+
+    def test_appended_linked_model_cell_keeps_table_border_when_source_link_style_has_no_border(self):
+        wb = Workbook()
+        ws = wb.active
+        ws["J1"] = "上新监控"
+        ws.merge_cells("J1:S1")
+        ws["J2"] = "上架日期"
+        ws.merge_cells("J2:J3")
+        ws["K2"] = "型号"
+        ws.merge_cells("K2:K3")
+        ws["L2"] = "形态"
+        ws.merge_cells("L2:L3")
+        ws["M2"] = "价格"
+        ws.merge_cells("M2:M3")
+        ws["N2"] = "直播价格"
+        ws.merge_cells("N2:R2")
+        ws["S2"] = "新卖点"
+        ws.merge_cells("S2:S3")
+        ws["A4"] = "索尼影音"
+        ws.merge_cells("A4:A5")
+        ws["K4"] = "existing-1"
+        ws["K5"] = "existing-2"
+        thin = Side(style="thin")
+        table_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        for row in range(4, 8):
+            for column in range(10, 20):
+                ws.cell(row=row, column=column).border = table_border
+        ws["K5"].style = "Hyperlink"
+        self.assertIsNone(ws["K5"].border.top.style)
+        ws["A6"] = "绿联"
+        ws.merge_cells("A6:A7")
+        ws.merge_cells("J6:S7")
+        ws["J6"] = "无上新"
+        layout = detect_new_product_layout(ws)
+        product = NewProduct(
+            brand="索尼影音",
+            on_sale_date=date(2026, 7, 3),
+            model="H9",
+            shape="头戴式",
+            price="1969",
+            link="https://example.com/h9",
+            selling_point="/",
+            source_id="h9",
+            raw_name="Sony H9",
+        )
+
+        stats = write_new_products(ws, layout, {"索尼影音": [product]}, no_data_text="无上新")
+
+        self.assertEqual(stats.written, 1)
+        self.assertEqual(ws["K6"].value, "H9")
+        self.assertEqual(ws["K6"].hyperlink.target, "https://example.com/h9")
+        self.assertEqual(ws["K6"].font.underline, "single")
+        self.assertEqual(ws["K6"].border.left.style, "thin")
+        self.assertEqual(ws["K6"].border.right.style, "thin")
+        self.assertEqual(ws["K6"].border.top.style, "thin")
+        self.assertEqual(ws["K6"].border.bottom.style, "thin")
 
     def test_matches_real_bi_shop_names_to_excel_brand_names(self):
         excel_brands = ["索爱", "索尼官方", "索尼影音", "JBL", "倍思"]

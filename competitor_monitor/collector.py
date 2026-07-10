@@ -87,7 +87,8 @@ class ProductCollector:
         if initial_data_price:
             return initial_data_price
 
-        option_texts = self.filter_sku_option_texts(expected_model, self.extract_sku_option_texts(page))
+        raw_option_texts = self.extract_sku_option_texts(page)
+        option_texts = self.filter_sku_option_texts(expected_model, raw_option_texts)
         if not option_texts:
             if self.page_misses_required_model_tokens(expected_model, fallback_visible_text or ""):
                 return None
@@ -101,6 +102,7 @@ class ProductCollector:
             if self.should_block_unmatched_sku_fallback(expected_model, option_texts):
                 return None
             return fallback_price
+        self.select_standard_package_option(page, raw_option_texts)
         prices: list[tuple[str, str]] = []
         for option_text in matched_options:
             if not self.click_sku_option(page, option_text):
@@ -114,16 +116,71 @@ class ProductCollector:
         return self._lowest_price_text([price for _, price in prices])
 
     @staticmethod
+    def select_standard_package_option(page, option_texts: list[str]) -> bool:
+        for option_text in option_texts:
+            text = str(option_text or "").strip()
+            if not ProductCollector.is_standard_package_option(text):
+                continue
+            return ProductCollector.click_sku_option(page, text)
+        return False
+
+    @staticmethod
+    def is_standard_package_option(option_text: str) -> bool:
+        normalized = normalize_sku_text(option_text)
+        markers = (
+            "\u5b98\u65b9\u6807\u914d",
+            "\u6807\u914d",
+            "\u6807\u51c6\u5957\u9910",
+            "\u6807\u51c6\u6b3e",
+            "\u57fa\u7840\u5957\u9910",
+            "\u57fa\u7840\u6b3e",
+        )
+        return any(normalize_sku_text(marker) in normalized for marker in markers)
+
+    @staticmethod
     def requires_explicit_sku_confirmation(expected_model: str) -> bool:
         return bool(required_exact_model_tokens(expected_model))
 
     @staticmethod
     def page_misses_required_model_tokens(expected_model: str, visible_text: str) -> bool:
-        tokens = required_exact_model_tokens(expected_model) or model_tokens(expected_model)
+        exact_tokens = required_exact_model_tokens(expected_model)
+        tokens = exact_tokens or model_tokens(expected_model)
         if not tokens:
             return False
         normalized_page = normalize_sku_text(visible_text)
-        return not any(token in normalized_page for token in tokens)
+        if any(token in normalized_page for token in tokens):
+            return False
+        if exact_tokens:
+            return True
+        return not ProductCollector._page_contains_distinctive_chinese_model_part(expected_model, normalized_page)
+
+    @staticmethod
+    def _page_contains_distinctive_chinese_model_part(expected_model: str, normalized_page: str) -> bool:
+        normalized_model = normalize_sku_text(expected_model)
+        if not re.search(r"[\u4e00-\u9fff]", normalized_model):
+            return False
+        generic_descriptors = (
+            "\u5934\u6234\u5f0f",
+            "\u5165\u8033\u5f0f",
+            "\u534a\u5165\u8033",
+            "\u5f00\u653e\u5f0f",
+            "\u9aa8\u4f20\u5bfc",
+            "\u4e3b\u52a8\u964d\u566a",
+            "\u964d\u566a",
+            "\u84dd\u7259",
+            "\u65e0\u7ebf",
+            "\u6709\u7ebf",
+            "\u8033\u673a",
+        )
+        distinctive = normalized_model
+        for descriptor in generic_descriptors:
+            distinctive = distinctive.replace(normalize_sku_text(descriptor), "")
+        candidates = [
+            part
+            for part in re.findall(r"[0-9a-z\u4e00-\u9fff]+", distinctive)
+            if len(part) >= 2
+        ]
+        return any(candidate in normalized_page for candidate in candidates)
 
     def should_block_unmatched_sku_fallback(self, expected_model: str, option_texts: list[str]) -> bool:
         normalized_model = normalize_sku_text(expected_model)

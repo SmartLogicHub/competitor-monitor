@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -28,7 +30,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     base_dir = runtime_base_dir()
-    config_path = Path(args.config) if args.config else base_dir / "competitor_monitor" / "config.yaml"
+    config_path = Path(args.config) if args.config else ensure_local_config(base_dir)
     if not config_path.is_absolute():
         config_path = base_dir / config_path
 
@@ -65,9 +67,44 @@ def main() -> int:
 
 
 def runtime_base_dir() -> Path:
+    override = os.environ.get("COMPETITOR_MONITOR_RUNTIME_DIR")
+    if override:
+        return Path(override).resolve()
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        return select_runtime_base_dir(Path(sys.executable), frozen=True)
     return Path(__file__).resolve().parents[1]
+
+
+def select_runtime_base_dir(executable_path: Path, frozen: bool = False) -> Path:
+    task_dir = executable_path.resolve().parent
+    if not frozen:
+        return Path(__file__).resolve().parents[1]
+
+    sibling_web_dir = task_dir.parent / "CompetitorMonitorWeb"
+    sibling_config = sibling_web_dir / "competitor_monitor" / "config.yaml"
+    sibling_example = sibling_web_dir / "competitor_monitor" / "config.example.yaml"
+    if sibling_config.exists() or sibling_example.exists():
+        return sibling_web_dir
+    return task_dir
+
+
+def ensure_local_config(base_dir: Path) -> Path:
+    config_path = base_dir / "competitor_monitor" / "config.yaml"
+    if config_path.exists():
+        return config_path
+
+    example_candidates = [base_dir / "competitor_monitor" / "config.example.yaml"]
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        example_candidates.append(Path(bundled_root) / "competitor_monitor" / "config.example.yaml")
+
+    for example_path in example_candidates:
+        if example_path.exists():
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(example_path, config_path)
+            return config_path
+
+    return config_path
 
 
 def display_path(path: Path, base_dir: Path) -> str:

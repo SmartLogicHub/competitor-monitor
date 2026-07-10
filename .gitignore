@@ -22,6 +22,11 @@ logs/
 backup/
 backup_acceptance/
 backup_real_test/
+release/
+e2e_runs/
+web_state/
+competitor_monitor/web_state/
+running-*-verified.png
 
 # Browser profiles and login sessions
 browser_profile*/

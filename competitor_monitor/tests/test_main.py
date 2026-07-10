@@ -1,4 +1,5 @@
 import logging
+import io
 import tempfile
 import threading
 import unittest
@@ -85,6 +86,42 @@ class MainCollectionOptionsTest(unittest.TestCase):
 
 
 class RunCollectionCheckpointTest(unittest.TestCase):
+    def test_run_collection_honors_stop_request_before_browser_startup(self):
+        wb = Workbook()
+        ws = wb.active
+        layout = SimpleNamespace(price_column=3, activity_column=9)
+        products = [SimpleNamespace(row=4, brand="A", name="P1", url="https://example.com/1")]
+        excel = FakeExcel(reload_layout=layout)
+        logger = logging.getLogger("test_run_collection_honors_stop_request_before_browser_startup")
+        stop_event = threading.Event()
+        stop_event.set()
+
+        with patch.object(main, "BrowserService", side_effect=AssertionError("browser should not start")):
+            stats = main.run_collection(
+                config={
+                    "min_delay_seconds": 0,
+                    "max_delay_seconds": 0,
+                    "retry_count": 0,
+                    "enable_sku_matching": False,
+                },
+                logger=logger,
+                excel=excel,
+                workbook=wb,
+                worksheet=ws,
+                layout=layout,
+                products=products,
+                test_one=False,
+                limit=None,
+                row_filter=None,
+                save_every=0,
+                excel_path=None,
+                target_date=date(2026, 7, 3),
+                stop_event=stop_event,
+            )
+
+        self.assertEqual(stats.total, 1)
+        self.assertEqual(stats.success, 0)
+
     def test_run_collection_collects_only_filtered_rows(self):
         wb = Workbook()
         ws = wb.active
@@ -99,11 +136,11 @@ class RunCollectionCheckpointTest(unittest.TestCase):
 
         with patch.object(main, "BrowserService", FakeBrowserService):
             with patch.object(main, "collect_with_retry", side_effect=fake_collect_with_retry) as collect_mock:
-                with patch.object(main.time, "sleep"):
+                with patch.object(main.time, "sleep") as sleep_mock:
                     stats = main.run_collection(
                         config={
-                            "min_delay_seconds": 0,
-                            "max_delay_seconds": 0,
+                            "min_delay_seconds": 5,
+                            "max_delay_seconds": 10,
                             "retry_count": 0,
                             "enable_sku_matching": False,
                         },
@@ -233,11 +270,11 @@ class RunCollectionCheckpointTest(unittest.TestCase):
 
         with patch.object(main, "BrowserService", FakeBrowserService):
             with patch.object(main, "collect_with_retry", side_effect=fake_collect_with_retry) as collect_mock:
-                with patch.object(main.time, "sleep"):
+                with patch.object(main.time, "sleep") as sleep_mock:
                     stats = main.run_collection(
                         config={
-                            "min_delay_seconds": 0,
-                            "max_delay_seconds": 0,
+                            "min_delay_seconds": 5,
+                            "max_delay_seconds": 10,
                             "retry_count": 0,
                             "enable_sku_matching": False,
                         },
@@ -732,6 +769,67 @@ class RunCollectionCheckpointTest(unittest.TestCase):
         self.assertEqual(ws.cell(row=91, column=3).value, "/")
         self.assertEqual(ws.cell(row=91, column=9).value, "/")
 
+    def test_run_collection_does_not_mark_chinese_model_parts_as_delisted(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "7.6-7.10"
+        layout = SimpleNamespace(price_column=3, activity_column=9, date_price_columns=[3, 4, 5, 6, 7])
+        products = [
+            SimpleNamespace(
+                row=57,
+                brand="\u6c34\u6708\u96e8",
+                name="\u7fbd\u7ffc\u5934\u6234\u5f0f",
+                url="https://detail.tmall.com/item.htm?id=851486873910",
+            )
+        ]
+        excel = FakeExcel(reload_layout=layout)
+        logger = logging.getLogger("test_run_collection_does_not_mark_chinese_model_parts_as_delisted")
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger.addHandler(handler)
+        logger.setLevel(logging.WARNING)
+        snapshot = SimpleNamespace(
+            price="399",
+            activities=["/"],
+            visible_text=(
+                "\u6c34\u6708\u96e8\u7fbd\u7ffc Edge ANC "
+                "\u4e3b\u52a8\u964d\u566aHiFi\u97f3\u8d28\u771f\u65e0\u7ebf"
+                "\u5934\u6234\u5f0f\u84dd\u72595.4\u8033\u673a "
+                "\u5e97\u94fa\u4f18\u60e0\u540e \uffe5399"
+            ),
+        )
+
+        try:
+            with patch.object(main, "BrowserService", FakeBrowserService):
+                with patch.object(main, "collect_with_retry", return_value=snapshot):
+                    with patch.object(main.time, "sleep"):
+                        stats = main.run_collection(
+                            config={
+                                "min_delay_seconds": 0,
+                                "max_delay_seconds": 0,
+                                "retry_count": 0,
+                                "enable_sku_matching": True,
+                            },
+                            logger=logger,
+                            excel=excel,
+                            workbook=wb,
+                            worksheet=ws,
+                            layout=layout,
+                            products=products,
+                            test_one=False,
+                            limit=None,
+                            save_every=0,
+                            excel_path=None,
+                            target_date=date(2026, 7, 6),
+                        )
+        finally:
+            logger.removeHandler(handler)
+
+        self.assertEqual(stats.success, 1)
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(ws.cell(row=57, column=3).value, "399")
+        self.assertNotIn("\u7591\u4f3c\u4e0b\u67b6", stream.getvalue())
+
     def test_run_collection_stops_before_starting_next_product(self):
         wb = Workbook()
         ws = wb.active
@@ -753,11 +851,11 @@ class RunCollectionCheckpointTest(unittest.TestCase):
 
         with patch.object(main, "BrowserService", FakeBrowserService):
             with patch.object(main, "collect_with_retry", side_effect=fake_collect_with_retry) as collect_mock:
-                with patch.object(main.time, "sleep"):
+                with patch.object(main.time, "sleep") as sleep_mock:
                     stats = main.run_collection(
                         config={
-                            "min_delay_seconds": 0,
-                            "max_delay_seconds": 0,
+                            "min_delay_seconds": 5,
+                            "max_delay_seconds": 10,
                             "retry_count": 0,
                             "enable_sku_matching": False,
                         },
@@ -781,6 +879,51 @@ class RunCollectionCheckpointTest(unittest.TestCase):
         self.assertEqual(ws.cell(row=4, column=3).value, "99.00")
         self.assertIsNone(ws.cell(row=5, column=3).value)
         self.assertEqual(progress_events[-1]["status"], "success")
+        sleep_mock.assert_not_called()
+
+    def test_run_collection_skips_startup_login_check_when_storage_state_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage_state = Path(tmpdir) / "storage_state.json"
+            storage_state.write_text('{"cookies":[{"name":"_tb_token_","value":"x","domain":".taobao.com","path":"/"}]}', encoding="utf-8")
+            wb = Workbook()
+            ws = wb.active
+            layout = SimpleNamespace(price_column=3, activity_column=9)
+            products = [SimpleNamespace(row=4, brand="A", name="P1", url="https://example.com/1")]
+            excel = FakeExcel(reload_layout=layout)
+            logger = logging.getLogger("test_run_collection_skips_startup_login_check_when_storage_state_exists")
+            instances = []
+
+            class BrowserWithLoginProbe(FakeBrowserService):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    instances.append(self)
+
+            with patch.object(main, "BrowserService", BrowserWithLoginProbe):
+                with patch.object(main, "collect_with_retry", side_effect=fake_collect_with_retry):
+                    with patch.object(main.time, "sleep"):
+                        stats = main.run_collection(
+                            config={
+                                "min_delay_seconds": 0,
+                                "max_delay_seconds": 0,
+                                "retry_count": 0,
+                                "enable_sku_matching": False,
+                                "browser_storage_state_path": str(storage_state),
+                            },
+                            logger=logger,
+                            excel=excel,
+                            workbook=wb,
+                            worksheet=ws,
+                            layout=layout,
+                            products=products,
+                            test_one=False,
+                            limit=None,
+                            save_every=0,
+                            excel_path=None,
+                        )
+
+        self.assertEqual(stats.success, 1)
+        self.assertEqual(len(instances), 1)
+        self.assertFalse(instances[0].login_checked)
 
 
 class WeeklyNewProductModeTest(unittest.TestCase):
@@ -945,10 +1088,15 @@ class PriceTrendModeTest(unittest.TestCase):
             )
 
             self.assertEqual(stats.total, 1)
-            self.assertEqual(len(progress_events), 1)
-            self.assertEqual(progress_events[0]["status"], "skipped")
-            self.assertEqual(progress_events[0]["error"], "dry-run")
-            self.assertEqual(progress_events[0]["model"], "S6S proII")
+            self.assertTrue(progress_events)
+            self.assertEqual(progress_events[0]["event"], "phase")
+            self.assertEqual(progress_events[0]["total"], 1)
+            self.assertIn("1", progress_events[0]["step"])
+            product_events = [event for event in progress_events if event.get("event") != "phase"]
+            self.assertEqual(len(product_events), 1)
+            self.assertEqual(product_events[0]["status"], "skipped")
+            self.assertEqual(product_events[0]["error"], "dry-run")
+            self.assertEqual(product_events[0]["model"], "S6S proII")
 
     def test_run_daily_price_job_updates_price_trend_after_friday_collection(self):
         with tempfile.TemporaryDirectory() as tmpdir:

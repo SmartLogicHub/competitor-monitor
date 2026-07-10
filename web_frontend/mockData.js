@@ -13,6 +13,18 @@
     today,
     config: {
       excel_path: "竞品监控.xlsx",
+      template_name: "竞品监控.xlsx",
+      template_path: "项目根目录/竞品监控.xlsx",
+      template_uploaded_at: null,
+      template_validation_status: "待验证",
+      workbook_sync_status: "synced",
+      workbook_sync_status_text: "已同步",
+      primary_workbook_path: "项目根目录/竞品监控.xlsx",
+      active_workbook_path: "项目根目录/竞品监控.xlsx",
+      pending_sync_path: null,
+      last_workbook_sync_at: null,
+      last_workbook_sync_error: null,
+      run_workbook_count: 0,
       daily_run_time: "10:00",
       bi_run_saturday: true,
       bi_run_sunday: true,
@@ -45,6 +57,14 @@
       system_status: "idle",
       template_name: "竞品监控.xlsx",
       template_path: "竞品监控.xlsx",
+      workbook_sync_status: "synced",
+      workbook_sync_status_text: "已同步",
+      primary_workbook_path: "项目根目录/竞品监控.xlsx",
+      active_workbook_path: "项目根目录/竞品监控.xlsx",
+      pending_sync_path: null,
+      last_workbook_sync_at: null,
+      last_workbook_sync_error: null,
+      run_workbook_count: 0,
       target_sheet_name: sheetName,
       target_period_range: `${periodStart} 至 ${periodEnd}`,
       progress_total: 86,
@@ -91,7 +111,7 @@
           precheck: "价格完整性待检查"
         }
       ],
-      maintenance: { logs: 4, backups: 3, exports: 0, sessions: 2 },
+      maintenance: { logs: 4, backups: 3, results: 5 },
       ui: { primary_action: "backfill" }
     },
 

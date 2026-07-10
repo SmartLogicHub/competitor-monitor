@@ -179,11 +179,13 @@ class BrowserService:
         user_data_dir: Path | str = "browser_profile",
         context_config: dict[str, Any] | None = None,
         taobao_credentials: AccountCredentials | None = None,
+        stop_event: Any | None = None,
     ):
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.user_data_dir = Path(user_data_dir)
         self.context_config = context_config or {}
+        self.stop_event = stop_event
         self.storage_state_path = Path(
             self.context_config.get("browser_storage_state_path") or self.user_data_dir / "storage_state.json"
         )
@@ -194,7 +196,7 @@ class BrowserService:
         self.operation_max_delay_seconds = float(
             self.context_config.get("operation_max_delay_seconds", DEFAULT_OPERATION_MAX_DELAY_SECONDS)
         )
-        self._taobao_auto_login_submitted = False
+        self._taobao_auto_login_attempts = 0
         self._playwright = None
         self._context = None
 
@@ -230,6 +232,8 @@ class BrowserService:
         page = self._context.new_page()
         self._attach_manual_action_settings(page)
         try:
+            if self._stop_requested():
+                return detect_page_auth_state(page)
             try:
                 page.goto(check_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             except Exception:
@@ -241,28 +245,39 @@ class BrowserService:
                     timeout=self.timeout_ms,
                 )
             self.wait_after_operation()
+            if self._stop_requested():
+                return detect_page_auth_state(page)
             return self._recover_page_auth(page)
         finally:
             page.close()
 
-    def login_taobao(self, page, credentials: AccountCredentials | None = None) -> None:
+    def login_taobao(self, page, credentials: AccountCredentials | None = None) -> PageAuthState:
+        self._attach_manual_action_settings(page)
+        if self._stop_requested():
+            return detect_page_auth_state(page)
         credentials = credentials or self.taobao_credentials
         if not credentials:
-            self._pause_for_manual_action(page, "页面需要登录淘宝/天猫，但未配置账号密码。请在浏览器中手动登录，完成后程序会自动继续...")
-            return
-        if self._taobao_auto_login_submitted:
-            self._pause_for_manual_action(page, "淘宝登录或验证尚未确认完成。请在浏览器中完成验证，程序会等待登录状态稳定后继续...")
-            return
+            return self._pause_for_manual_action(page, "页面需要登录淘宝/天猫，但未配置账号密码。请在浏览器中手动登录，完成后程序会自动继续...")
+        if self._taobao_auto_login_attempts >= self._taobao_auto_login_max_attempts():
+            return self._pause_for_manual_action(page, "淘宝登录或验证尚未确认完成。请在浏览器中完成验证，程序会等待登录状态稳定后继续...")
 
         self._open_taobao_login_page_if_needed(page)
+        if self._stop_requested():
+            return detect_page_auth_state(page)
         self._fill_first(page, TAOBAO_USERNAME_SELECTORS, credentials.username)
         self.wait_after_operation()
+        if self._stop_requested():
+            return detect_page_auth_state(page)
         self._fill_first(page, TAOBAO_PASSWORD_SELECTORS, credentials.password)
         self.wait_after_operation()
+        if self._stop_requested():
+            return detect_page_auth_state(page)
         self._click_taobao_login_options(page)
         self.wait_after_operation()
+        if self._stop_requested():
+            return detect_page_auth_state(page)
         self._click_first(page, TAOBAO_SUBMIT_SELECTORS)
-        self._taobao_auto_login_submitted = True
+        self._taobao_auto_login_attempts += 1
         self.wait_after_operation()
         try:
             page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
@@ -270,9 +285,14 @@ class BrowserService:
             pass
         state = detect_page_auth_state(page)
         if state == PageAuthState.MANUAL_ACTION_REQUIRED:
-            self._pause_for_manual_action(page, "页面需要人工验证。请在浏览器中处理完成，程序会自动继续...")
+            state = self._pause_for_manual_action(page, "页面需要人工验证。请在浏览器中处理完成，程序会自动继续...")
+            if state == PageAuthState.LOGIN_REQUIRED and self._taobao_auto_login_attempts < self._taobao_auto_login_max_attempts():
+                return self.login_taobao(page, credentials)
         elif state == PageAuthState.LOGIN_REQUIRED:
-            self._pause_for_manual_action(page, "自动登录未确认成功。请在浏览器中检查并完成登录，程序会自动继续...")
+            if self._taobao_auto_login_attempts < self._taobao_auto_login_max_attempts():
+                return self.login_taobao(page, credentials)
+            state = self._pause_for_manual_action(page, "自动登录未确认成功。请在浏览器中检查并完成登录，程序会自动继续...")
+        return state
 
     def click(self, page, target, **kwargs):
         if isinstance(target, str):
@@ -283,19 +303,43 @@ class BrowserService:
         return result
 
     def wait_after_operation(self) -> float:
-        return random_delay(self.operation_min_delay_seconds, self.operation_max_delay_seconds)
+        if self._stop_requested():
+            return 0.0
+        min_seconds = self.operation_min_delay_seconds
+        max_seconds = self.operation_max_delay_seconds
+        if max_seconds < min_seconds:
+            min_seconds, max_seconds = max_seconds, min_seconds
+        delay = random.uniform(min_seconds, max_seconds)
+        remaining = delay
+        poll_seconds = max(0.05, float(self.context_config.get("operation_stop_poll_seconds", 0.25)))
+        while remaining > 0:
+            if self._stop_requested():
+                break
+            sleep_seconds = min(poll_seconds, remaining)
+            time.sleep(sleep_seconds)
+            remaining -= sleep_seconds
+        return delay
 
     def _recover_page_auth(self, page) -> PageAuthState:
         self._attach_manual_action_settings(page)
         state = self._wait_for_auth_state_to_settle(page)
+        if self._stop_requested():
+            return state
         if state == PageAuthState.LOGIN_REQUIRED:
-            self.login_taobao(page, self.taobao_credentials)
+            state = self.login_taobao(page, self.taobao_credentials)
             state = self._wait_for_auth_state_to_settle(page)
+        if self._stop_requested():
+            return state
         if state == PageAuthState.MANUAL_ACTION_REQUIRED:
-            self._pause_for_manual_action(page, "页面需要人工登录或验证。请在浏览器中处理完成，程序会自动继续...")
+            state = self._pause_for_manual_action(page, "页面需要人工登录或验证。请在浏览器中处理完成，程序会自动继续...")
+            if state == PageAuthState.LOGIN_REQUIRED and self.taobao_credentials and self._taobao_auto_login_attempts < self._taobao_auto_login_max_attempts():
+                state = self.login_taobao(page, self.taobao_credentials)
             state = self._wait_for_auth_state_to_settle(page)
         self._persist_auth_state_if_authenticated(page)
         return state
+
+    def _taobao_auto_login_max_attempts(self) -> int:
+        return max(1, int(self.context_config.get("taobao_auto_login_max_attempts", 2)))
 
     def _persist_auth_state_if_authenticated(self, page) -> None:
         if detect_page_auth_state(page) != PageAuthState.AUTHENTICATED or not self._context:
@@ -322,6 +366,8 @@ class BrowserService:
         wait_seconds = max(0.0, float(self.context_config.get("taobao_login_state_check_seconds", 2)))
         state = detect_page_auth_state(page)
         for attempt in range(1, attempts):
+            if self._stop_requested():
+                return state
             if state in {PageAuthState.AUTHENTICATED, PageAuthState.MANUAL_ACTION_REQUIRED}:
                 return state
             try:
@@ -417,10 +463,14 @@ class BrowserService:
         except Exception:
             pass
 
-    @staticmethod
-    def _pause_for_manual_action(page, message: str) -> None:
+    def _pause_for_manual_action(self, page, message: str) -> PageAuthState:
+        self._attach_manual_action_settings(page)
         print(message, flush=True)
-        BrowserService._wait_for_manual_action_resolution(page, message)
+        return BrowserService._wait_for_manual_action_resolution(
+            page,
+            message,
+            allow_login_required=bool(self.taobao_credentials),
+        )
 
     def _attach_manual_action_settings(self, page) -> None:
         try:
@@ -434,23 +484,51 @@ class BrowserService:
                 "_manual_action_poll_seconds",
                 float(self.context_config.get("manual_action_poll_seconds", 2)),
             )
+            setattr(page, "_stop_event", self.stop_event)
         except Exception:
             pass
 
     @staticmethod
-    def _wait_for_manual_action_resolution(page, message: str) -> None:
+    def _wait_for_manual_action_resolution(page, message: str, allow_login_required: bool = False) -> PageAuthState:
         timeout_seconds = int(getattr(page, "_manual_action_timeout_seconds", 180) or 180)
         poll_seconds = float(getattr(page, "_manual_action_poll_seconds", 2) or 2)
         deadline = time.time() + timeout_seconds
+        stop_event = getattr(page, "_stop_event", None)
+
+        def stop_requested() -> bool:
+            try:
+                return bool(stop_event is not None and stop_event.is_set())
+            except Exception:
+                return False
+
+        state = detect_page_auth_state(page)
+        if stop_requested():
+            return state
+        seen_manual_action = state == PageAuthState.MANUAL_ACTION_REQUIRED
         while time.time() < deadline:
+            if stop_requested():
+                return detect_page_auth_state(page)
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=1000)
             except Exception:
                 pass
-            if detect_page_auth_state(page) == PageAuthState.AUTHENTICATED:
-                return
+            state = detect_page_auth_state(page)
+            if stop_requested():
+                return state
+            if state == PageAuthState.AUTHENTICATED:
+                return state
+            if state == PageAuthState.MANUAL_ACTION_REQUIRED:
+                seen_manual_action = True
+            if allow_login_required and seen_manual_action and state == PageAuthState.LOGIN_REQUIRED:
+                return state
             time.sleep(poll_seconds)
         raise RuntimeError(f"{message} 等待人工处理超时，请完成验证后重新运行")
+
+    def _stop_requested(self) -> bool:
+        try:
+            return bool(self.stop_event is not None and self.stop_event.is_set())
+        except Exception:
+            return False
 
     def _launch_persistent_context(self):
         launch_options = {
