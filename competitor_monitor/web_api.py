@@ -890,8 +890,35 @@ class WebApiService:
             shared_updated = _parse_log_time(shared.get("state_updated_at"))
             if shared_updated and (not local_updated or shared_updated >= local_updated):
                 self.status.update(shared)
+                self._clear_stale_running_status_locked()
         except Exception:
             return
+
+    def _clear_stale_running_status_locked(self) -> None:
+        if not self._is_running_locked():
+            return
+        runner_pid = _coerce_pid(self.status.get("runner_pid"))
+        if runner_pid and _process_exists(runner_pid):
+            return
+        if not runner_pid and not self._active_status_is_stale_without_pid():
+            return
+        self.status["system_status"] = "stopped"
+        self.status["current_step"] = "上次任务已中断，可重新启动"
+        self.status["finished_at"] = _now_text()
+        self.status["duration"] = _duration_text(self.status.get("started_at"), self.status["finished_at"])
+        self.status["stop_requested"] = False
+        self.status["stop_requested_at"] = None
+        self.status["runner_pid"] = None
+        self.current_thread = None
+        self.stop_event.clear()
+        self._persist_status_locked()
+        self.log("warning", "检测到上次任务已中断", "已清理残留停止状态，可以重新启动任务")
+
+    def _active_status_is_stale_without_pid(self) -> bool:
+        updated_at = _parse_log_time(self.status.get("state_updated_at"))
+        if not updated_at:
+            return False
+        return (datetime.now() - updated_at).total_seconds() > 30 * 60
 
     def _record_collection_progress(self, mode: str, event: dict[str, Any]) -> None:
         if event.get("event") == "phase":
@@ -1409,6 +1436,42 @@ def _hidden_subprocess_kwargs() -> dict[str, Any]:
         startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
         kwargs["startupinfo"] = startupinfo
     return kwargs
+
+
+def _coerce_pid(value: Any) -> int | None:
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
 
 
 def _mask_account(value: str) -> str:

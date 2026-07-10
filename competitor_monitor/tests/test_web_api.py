@@ -357,6 +357,45 @@ class WebApiServiceTest(unittest.TestCase):
             self.assertEqual(service.get_results()[0]["model"], "S6S Ultra")
             self.assertEqual(service.get_logs(level="warning")[0]["message"], "收到停止请求")
 
+    def test_stale_stopping_status_from_dead_runner_is_cleared_on_startup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            web_state_dir = base_dir / "competitor_monitor" / "web_state"
+            web_state_dir.mkdir(parents=True)
+            (web_state_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "system_status": "running",
+                        "current_step": "已请求停止，等待当前步骤结束",
+                        "started_at": "2026-07-10 10:00:00",
+                        "finished_at": None,
+                        "duration": "-",
+                        "active_mode": "daily_price",
+                        "stop_requested": True,
+                        "stop_requested_at": "2026-07-10 10:01:00",
+                        "runner_pid": 999999,
+                        "state_updated_at": "2026-07-10 10:01:00",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (web_state_dir / "stop_request.json").write_text(
+                json.dumps({"stop_requested": True, "requested_at": "2026-07-10 10:01:00"}),
+                encoding="utf-8",
+            )
+            service = WebApiService(base_dir=base_dir)
+
+            with patch("web_api._process_exists", return_value=False):
+                status = service.get_tasks_status()
+
+            self.assertEqual(status["system_status"], "stopped")
+            self.assertFalse(status["stop_requested"])
+            self.assertIsNone(status["runner_pid"])
+            self.assertIn("中断", status["current_step"])
+            stop_payload = json.loads((web_state_dir / "stop_request.json").read_text(encoding="utf-8"))
+            self.assertFalse(stop_payload["stop_requested"])
+
     def test_collection_phase_progress_updates_status_without_result_row(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             service = WebApiService(base_dir=Path(tmpdir))
