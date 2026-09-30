@@ -11,6 +11,12 @@
 
   window.CompetitorMonitorMock = {
     today,
+    loginSession: {
+      target: "taobao",
+      status: "closed",
+      auth_status: "checking",
+      error: null
+    },
     config: {
       excel_path: "竞品监控.xlsx",
       template_name: "竞品监控.xlsx",

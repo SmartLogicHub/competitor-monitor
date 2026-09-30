@@ -5,6 +5,7 @@ from copy import copy
 from dataclasses import dataclass
 from typing import Iterable
 
+from openpyxl.cell.cell import MergedCell
 from openpyxl.worksheet.cell_range import CellRange
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -37,8 +38,11 @@ class NewProductWriteStats:
     written: int = 0
     skipped_duplicates: int = 0
     no_data_written: int = 0
+    no_data_brands: int = 0
     failed: int = 0
     failure_details: tuple[str, ...] = ()
+    skipped: bool = False
+    skipped_reason: str = ""
 
 
 def detect_new_product_layout(worksheet: Worksheet) -> NewProductLayout:
@@ -70,16 +74,59 @@ def detect_new_product_layout(worksheet: Worksheet) -> NewProductLayout:
     )
 
 
+def _is_url_value(value) -> bool:
+    text = str(value or "").strip().lower()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def heal_new_product_area(worksheet: Worksheet, layout: NewProductLayout) -> dict[str, int]:
+    """Clear leftover dirty data in the BI 上新 area so it self-heals.
+
+    Repairs two kinds of residue:
+    1. blank merged blocks (a "无上新" marker whose text was cleared) — these are
+       unmerged so later row appends never hit a read-only ``MergedCell``;
+    2. cells whose value is a URL (a model cell whose hyperlink re-materialized
+       as text after the old template copy) — cleared together with the hyperlink.
+
+    Valid product data (model names, dates, prices, "无上新" text) is left intact.
+    """
+    cleared_urls = 0
+    unmerged_blocks = 0
+
+    for merged_range in list(worksheet.merged_cells.ranges):
+        if not (
+            merged_range.min_col >= layout.start_column
+            and merged_range.min_row >= layout.data_start_row
+        ):
+            continue
+        anchor = worksheet.cell(row=merged_range.min_row, column=merged_range.min_col)
+        if _cell_text(anchor) == "":
+            worksheet.unmerge_cells(str(merged_range))
+            unmerged_blocks += 1
+
+    for row in range(layout.data_start_row, worksheet.max_row + 1):
+        for column in range(layout.start_column, worksheet.max_column + 1):
+            cell = worksheet.cell(row=row, column=column)
+            if _is_url_value(cell.value):
+                cell.value = None
+                cell.hyperlink = None
+                cleared_urls += 1
+
+    return {"cleared_urls": cleared_urls, "unmerged_blocks": unmerged_blocks}
+
+
 def write_new_products(
     worksheet: Worksheet,
     layout: NewProductLayout,
     products_by_brand: dict[str, list[NewProduct]],
     no_data_text: str = "无上新",
     force_overwrite: bool = False,
+    overwrite_empty_brands: bool = False,
 ) -> NewProductWriteStats:
     written = 0
     skipped_duplicates = 0
     no_data_written = 0
+    no_data_brands = 0
     failed = 0
     failure_details: list[str] = []
 
@@ -97,7 +144,14 @@ def write_new_products(
             continue
         brand_range = right_ranges.get(matched_range.brand, matched_range)
         if not products:
-            changed = _write_no_new_if_needed(worksheet, layout, brand_range, no_data_text, force_overwrite)
+            no_data_brands += 1
+            changed = _write_no_new_if_needed(
+                worksheet,
+                layout,
+                brand_range,
+                no_data_text,
+                force_overwrite or overwrite_empty_brands,
+            )
             no_data_written += 1 if changed else 0
             continue
         if _range_has_no_data_marker(worksheet, layout, brand_range, no_data_text) or force_overwrite:
@@ -127,6 +181,7 @@ def write_new_products(
                     continue
             _write_product_row(worksheet, layout, row, product)
             if appended_row:
+                brand_ranges = _detect_brand_ranges(worksheet, layout.data_start_row)
                 right_ranges = _detect_right_brand_ranges(worksheet, layout, brand_ranges, no_data_text)
             written += 1
             existing_keys.update(product_keys)
@@ -135,6 +190,7 @@ def write_new_products(
         written=written,
         skipped_duplicates=skipped_duplicates,
         no_data_written=no_data_written,
+        no_data_brands=no_data_brands,
         failed=failed,
         failure_details=tuple(failure_details),
     )
@@ -343,8 +399,10 @@ def _append_empty_row_to_brand_range(
     source_row = brand_range.end_row
 
     claimed_from_no_data = _claim_row_from_no_data_marker(worksheet, layout, insert_row, no_data_text)
-    if not claimed_from_no_data and _right_row_has_any_data(worksheet, layout, insert_row):
-        _shift_right_area_down(worksheet, layout, insert_row)
+    if not claimed_from_no_data:
+        # 下一行既不是「无上新」占位，就整体插入一行：A列/B-I/J:S 一起下移，
+        # 并扩展当前品牌的 A 列标签，避免新品串到下一家的行里。
+        _insert_full_row(worksheet, insert_row, brand_start_row=brand_range.start_row)
     for column in range(layout.start_column, layout.end_column + 1):
         source_cell = worksheet.cell(row=source_row, column=column)
         target_cell = worksheet.cell(row=insert_row, column=column)
@@ -352,6 +410,74 @@ def _append_empty_row_to_brand_range(
         target_cell.value = None
         target_cell.hyperlink = None
     return BrandRange(brand=brand_range.brand, start_row=brand_range.start_row, end_row=insert_row)
+
+
+def _force_writable_cell(worksheet: Worksheet, row: int, column: int):
+    """Return a regular writable Cell, replacing a cached MergedCell if present."""
+    row_cells = worksheet._cells.get(row)
+    if row_cells and column in row_cells and isinstance(row_cells[column], MergedCell):
+        del row_cells[column]
+    return worksheet.cell(row=row, column=column)
+
+
+def _insert_full_row(
+    worksheet: Worksheet,
+    insert_row: int,
+    brand_start_row: int | None = None,
+) -> None:
+    """Insert a whole row at ``insert_row``, shifting everything below down one row.
+
+    Column A (brand labels), B-I (mature products) and J:S (new products) shift
+    together so they stay aligned. When ``brand_start_row`` is given, that brand's
+    column-A merged label is expanded by one row so overflow products keep their
+    brand label.
+    """
+    max_row = worksheet.max_row
+    max_col = worksheet.max_column
+
+    merge_specs: list[tuple[int, int, int, int]] = []
+    for merged_range in list(worksheet.merged_cells.ranges):
+        is_brand_merge = (
+            brand_start_row is not None
+            and merged_range.min_col <= 1 <= merged_range.max_col
+            and merged_range.min_row == brand_start_row
+            and merged_range.max_row < insert_row
+        )
+        if is_brand_merge:
+            merge_specs.append(
+                (merged_range.min_col, merged_range.max_col, merged_range.min_row, merged_range.max_row + 1)
+            )
+            worksheet.unmerge_cells(str(merged_range))
+        elif merged_range.max_row >= insert_row:
+            new_min = merged_range.min_row if merged_range.min_row < insert_row else merged_range.min_row + 1
+            merge_specs.append(
+                (merged_range.min_col, merged_range.max_col, new_min, merged_range.max_row + 1)
+            )
+            worksheet.unmerge_cells(str(merged_range))
+
+    snapshot: dict[tuple[int, int], tuple] = {}
+    for row in range(insert_row, max_row + 1):
+        for column in range(1, max_col + 1):
+            cell = worksheet.cell(row=row, column=column)
+            snapshot[(row, column)] = (
+                _style_snapshot(cell),
+                cell.value,
+                copy(cell.hyperlink) if cell.hyperlink else None,
+            )
+
+    for (row, column), (style, value, hyperlink) in snapshot.items():
+        target = _force_writable_cell(worksheet, row + 1, column)
+        _apply_style_snapshot(target, style)
+        target.value = value
+        target.hyperlink = hyperlink
+
+    for column in range(1, max_col + 1):
+        cell = _force_writable_cell(worksheet, insert_row, column)
+        cell.value = None
+        cell.hyperlink = None
+
+    for min_col, max_col, new_min, new_max in merge_specs:
+        worksheet.merge_cells(start_row=new_min, start_column=min_col, end_row=new_max, end_column=max_col)
 
 
 def _claim_row_from_no_data_marker(
@@ -412,60 +538,6 @@ def _merge_no_data_remainder(
     marker_cell = worksheet.cell(row=start_row, column=layout.start_column)
     _apply_style_snapshot(marker_cell, style)
     marker_cell.value = no_data_text
-
-
-def _shift_right_area_down(worksheet: Worksheet, layout: NewProductLayout, insert_row: int) -> None:
-    shifted_merged_ranges = _remove_and_shift_right_merged_ranges_at_or_below(worksheet, layout, insert_row)
-    bottom_row = max(
-        [worksheet.max_row]
-        + [max_row for _, _, max_row, _ in shifted_merged_ranges]
-        + [insert_row]
-    )
-    for row in range(bottom_row, insert_row - 1, -1):
-        for column in range(layout.start_column, layout.end_column + 1):
-            _copy_cell(worksheet.cell(row=row, column=column), worksheet.cell(row=row + 1, column=column))
-    for column in range(layout.start_column, layout.end_column + 1):
-        cell = worksheet.cell(row=insert_row, column=column)
-        cell.value = None
-        cell.hyperlink = None
-    for min_row, min_col, max_row, max_col in shifted_merged_ranges:
-        worksheet.merge_cells(start_row=min_row, start_column=min_col, end_row=max_row, end_column=max_col)
-
-
-def _remove_and_shift_right_merged_ranges_at_or_below(
-    worksheet: Worksheet,
-    layout: NewProductLayout,
-    insert_row: int,
-) -> list[tuple[int, int, int, int]]:
-    shifted: list[tuple[int, int, int, int]] = []
-    for merged_range in list(worksheet.merged_cells.ranges):
-        if not (
-            merged_range.min_col >= layout.start_column
-            and merged_range.max_col <= layout.end_column
-            and merged_range.max_row >= insert_row
-        ):
-            continue
-        if merged_range.min_row >= insert_row:
-            shifted.append(
-                (
-                    merged_range.min_row + 1,
-                    merged_range.min_col,
-                    merged_range.max_row + 1,
-                    merged_range.max_col,
-                )
-            )
-            worksheet.unmerge_cells(str(merged_range))
-        elif merged_range.min_row < insert_row <= merged_range.max_row:
-            shifted.append(
-                (
-                    merged_range.min_row,
-                    merged_range.min_col,
-                    merged_range.max_row + 1,
-                    merged_range.max_col,
-                )
-            )
-            worksheet.unmerge_cells(str(merged_range))
-    return shifted
 
 
 def _range_has_no_data_marker(

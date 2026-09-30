@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -21,8 +22,10 @@ from config_service import load_config
 from credential_service import load_bi_credentials, load_taobao_credentials, save_account_credentials
 from date_service import build_sheet_name, get_work_week, parse_sheet_range
 from excel_service import ExcelService, TemplateCompleteness, WorkbookLockedError, backup_excel
+from new_product_writer import detect_new_product_layout
 from notification_formatter import format_wecom_summary
 from state_file_service import atomic_write_json
+from taobao_cookie_service import CookieImportError, import_taobao_cookie_export
 from wecom_service import WeComNotifyError, send_wecom_template
 from workbook_state_service import SYNCED, WorkbookStateService
 
@@ -42,6 +45,7 @@ Runner = Callable[["RunContext"], None]
 Notifier = Callable[[dict[str, Any], Path, str], dict[str, str | None]]
 SchedulerSyncer = Callable[[dict[str, Any]], None]
 TodayProvider = Callable[[], date]
+ProcessLauncher = Callable[..., Any]
 
 
 @dataclass
@@ -94,6 +98,7 @@ class WebApiService:
         notifier: Notifier | None = None,
         scheduler_syncer: SchedulerSyncer | None = None,
         today_provider: TodayProvider | None = None,
+        manual_login_launcher: ProcessLauncher | None = None,
     ) -> None:
         self.base_dir = Path(base_dir or Path.cwd()).resolve()
         self.config_path = Path(config_path) if config_path else self.base_dir / "competitor_monitor" / "config.yaml"
@@ -103,16 +108,19 @@ class WebApiService:
         self.notifier = notifier or send_wecom_template
         self.scheduler_syncer = scheduler_syncer or self._sync_windows_scheduled_tasks
         self.today_provider = today_provider or date.today
+        self.manual_login_launcher = manual_login_launcher or subprocess.Popen
         self.web_state_dir = self.base_dir / "competitor_monitor" / "web_state"
         self.results_path = self.web_state_dir / "results.jsonl"
         self.status_path = self.web_state_dir / "status.json"
         self.stop_request_path = self.web_state_dir / "stop_request.json"
+        self.manual_login_state_path = self.web_state_dir / "taobao_login_session.json"
         self.workbook_state = WorkbookStateService(self.base_dir, self.web_state_dir)
         self.lock = threading.RLock()
         self.scheduler_lock = threading.Lock()
         self.stop_event = SharedStopEvent(self)
         self.current_thread: threading.Thread | None = None
         self.schedule_thread: threading.Thread | None = None
+        self.manual_login_process = None
         self.log_view_cleared_at: datetime | None = None
         self.logs: list[dict[str, Any]] = []
         self.results: list[dict[str, Any]] = self._load_persisted_results()
@@ -191,12 +199,17 @@ class WebApiService:
     def run_task(self, payload: dict[str, Any]) -> dict[str, str]:
         with self.lock:
             self._refresh_status_from_shared_state_locked()
+            if self._manual_login_is_running_locked():
+                return {
+                    "message": "淘宝登录网页正在打开，请先关闭登录浏览器再运行采集",
+                    "error": "manual_login_running",
+                }
             if self._is_running_locked():
                 return {"message": "已有任务正在运行"}
             self.stop_event.clear()
             now = _now_text()
             mode = payload.get("mode") or "daily_price"
-            run_date = _parse_date(payload.get("run_date")) if payload.get("run_date") else date.today()
+            run_date = _parse_date(payload.get("run_date")) if payload.get("run_date") else self.today_provider()
             week = get_work_week(run_date)
             self.status.update(
                 {
@@ -309,6 +322,11 @@ class WebApiService:
     def backfill_template(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             self._refresh_status_from_shared_state_locked()
+            if self._manual_login_is_running_locked():
+                return {
+                    "message": "淘宝登录网页正在打开，请先关闭登录浏览器再补跑",
+                    "error": "manual_login_running",
+                }
             if self._is_running_locked():
                 return {"message": "已有任务正在运行"}
             dates = [str(item) for item in (payload.get("dates") or []) if str(item).strip()]
@@ -437,7 +455,7 @@ class WebApiService:
             "test_one": bool(config.get("test_one", False)),
             "rows": config.get("rows", ""),
             "limit": config.get("limit", ""),
-            "save_every": config.get("save_every", config.get("save_every_n_products", 5)),
+            "save_every": config.get("save_every_n_products", config.get("save_every", 5)),
             "updated_at": config.get("updated_at"),
         }
         public.update(self._workbook_status_payload(config))
@@ -460,10 +478,15 @@ class WebApiService:
             "test_one",
             "rows",
             "limit",
-            "save_every",
         ]:
             if key in payload:
                 config[key] = payload[key]
+
+        if "save_every" in payload:
+            config["save_every_n_products"] = int(payload["save_every"])
+        elif "save_every_n_products" not in config and "save_every" in config:
+            config["save_every_n_products"] = int(config["save_every"])
+        config.pop("save_every", None)
 
         if "bi_run_saturday" in payload or "bi_run_sunday" in payload:
             weekdays = []
@@ -574,9 +597,115 @@ class WebApiService:
         if target not in {"taobao", "bi"}:
             return {"message": "未知登录状态类型"}
         with self.lock:
+            if target == "taobao" and self._manual_login_is_running_locked():
+                return {
+                    "message": "淘宝登录网页正在打开，请先关闭浏览器再清除登录状态",
+                    "error": "manual_login_running",
+                }
             self.session_status[target] = "需重新登录"
         self.log("warning", "登录状态已重置", f"{target} 下次运行会重新检查登录")
         return {"message": "登录状态已重置"}
+
+    def import_taobao_cookies(self, filename: str, content: bytes) -> dict[str, Any]:
+        with self.lock:
+            self._refresh_status_from_shared_state_locked()
+            if self._is_running_locked():
+                return {
+                    "message": "采集任务正在运行，请先停止或等待任务完成",
+                    "error": "task_running",
+                }
+            if self._manual_login_is_running_locked():
+                return {
+                    "message": "淘宝登录网页正在打开，请先关闭登录浏览器再导入 Cookie",
+                    "error": "manual_login_running",
+                }
+
+        if not str(filename or "").lower().endswith(".json"):
+            return {"message": "请选择 JSON 格式的 Cookie 文件", "error": "invalid_cookie_file"}
+        if not content or len(content) > 5 * 1024 * 1024:
+            return {"message": "Cookie 文件为空或超过 5 MB", "error": "invalid_cookie_file"}
+
+        config = self._runtime_config(self._load_config())
+        storage_path = Path(
+            config.get("browser_storage_state_path")
+            or self.base_dir / "competitor_monitor" / "browser_profile" / "storage_state.json"
+        )
+        try:
+            cookie_count = import_taobao_cookie_export(content, storage_path)
+        except CookieImportError as exc:
+            return {"message": str(exc), "error": "invalid_cookie_file"}
+        except OSError as exc:
+            return {"message": f"Cookie 保存失败：{exc}", "error": "cookie_save_failed"}
+
+        with self.lock:
+            self.session_status["taobao"] = "Cookie 已导入，待真实商品页验证"
+        self.log("success", "淘宝 Cookie 已导入", f"已导入 {cookie_count} 条淘宝/天猫 Cookie；内容未记录")
+        return {
+            "message": "Cookie 已导入；下次打开真实天猫商品页或运行采集时会验证登录状态",
+            "cookie_count": cookie_count,
+            "status": "imported_pending_validation",
+        }
+
+    def open_taobao_login(self) -> dict[str, Any]:
+        with self.lock:
+            self._refresh_status_from_shared_state_locked()
+            if self._is_running_locked():
+                return {
+                    "message": "采集任务正在运行，请先停止或等待任务完成",
+                    "error": "task_running",
+                }
+            if self._manual_login_is_running_locked():
+                return {
+                    "message": "淘宝登录网页已经打开",
+                    "error": "manual_login_running",
+                }
+            command = self._manual_login_command()
+            kwargs: dict[str, Any] = {"cwd": str(self.base_dir)}
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            try:
+                process = self.manual_login_launcher(command, **kwargs)
+            except Exception as exc:
+                self._write_manual_login_state("failed", error=str(exc), auth_status="checking")
+                self.log("error", "淘宝登录网页启动失败", str(exc))
+                return {"message": "淘宝登录网页启动失败", "error": str(exc), "status": "failed"}
+            self.manual_login_process = process
+            self._write_manual_login_state(
+                "running",
+                pid=getattr(process, "pid", None),
+                auth_status="checking",
+            )
+            self.log("info", "淘宝登录网页已打开", "请登录买家账号，完成后直接关闭浏览器窗口")
+            return {"message": "淘宝登录网页已打开", "status": "running", "auth_status": "checking"}
+
+    def get_login_session_status(self) -> dict[str, Any]:
+        with self.lock:
+            current = self._read_manual_login_state()
+            if self.manual_login_process is not None:
+                return_code = self.manual_login_process.poll()
+                if return_code is None:
+                    return {
+                        "target": "taobao",
+                        "status": "running",
+                        "auth_status": current.get("auth_status") or "checking",
+                        "error": current.get("error"),
+                    }
+                self.manual_login_process = None
+                if current.get("status") == "running":
+                    status = "closed" if return_code == 0 else "failed"
+                    error = None if return_code == 0 else f"登录浏览器退出码：{return_code}"
+                    self._write_manual_login_state(
+                        status,
+                        error=error,
+                        auth_status=current.get("auth_status") or "checking",
+                    )
+                    current = self._read_manual_login_state()
+            return {
+                "target": "taobao",
+                "status": current.get("status") or "closed",
+                "auth_status": current.get("auth_status") or "checking",
+                "error": current.get("error"),
+            }
 
     def set_progress_total(self, total: int) -> None:
         with self.lock:
@@ -652,6 +781,9 @@ class WebApiService:
                 if self.stop_event.is_set():
                     self.status["system_status"] = "stopped"
                     self.status["current_step"] = "已停止"
+                elif int(self.status.get("failed_count") or 0) > 0:
+                    self.status["system_status"] = "partial_success"
+                    self.status["current_step"] = "任务完成，部分项目失败"
                 else:
                     self.status["system_status"] = "success"
                     self.status["current_step"] = "任务完成"
@@ -694,11 +826,27 @@ class WebApiService:
                     },
                     self.stop_event,
                 )
-                self.runner(context)
+                try:
+                    self.runner(context)
+                except Exception as exc:
+                    self.log("error", f"补跑日期失败：{date_text}", str(exc))
+                    self._persist_task_failure(f"补跑日期失败：{date_text}", exc)
+                    context.record_result(
+                        {
+                            "mode": "daily_price",
+                            "model": f"补跑 {date_text}",
+                            "status": "failed",
+                            "error": str(exc),
+                            "error_reason": str(exc),
+                        }
+                    )
             with self.lock:
                 if self.stop_event.is_set():
                     self.status["system_status"] = "stopped"
                     self.status["current_step"] = "已停止"
+                elif int(self.status.get("failed_count") or 0) > 0:
+                    self.status["system_status"] = "partial_success"
+                    self.status["current_step"] = "补跑完成，部分日期失败"
                 else:
                     self.status["system_status"] = "success"
                     self.status["current_step"] = "补跑完成"
@@ -723,7 +871,7 @@ class WebApiService:
         from logger_service import setup_logger
 
         config = self._runtime_config(self._load_config())
-        run_date = _parse_date(context.payload.get("run_date")) if context.payload.get("run_date") else date.today()
+        run_date = _parse_date(context.payload.get("run_date")) if context.payload.get("run_date") else self.today_provider()
         mode = context.payload.get("mode") or "daily_price"
         primary_excel_path = self._resolve_path(config.get("excel_path", "竞品监控.xlsx"))
         self.workbook_state.try_sync_latest_to_primary(primary_excel_path)
@@ -793,16 +941,22 @@ class WebApiService:
                     run_date,
                     bool(context.payload.get("dry_run", False)),
                     excel_path,
+                    manual_run=bool(context.payload.get("manual_run", False)),
                 )
                 self.record_task_summary(
                     "weekly_new",
                     "周末 BI 上新",
                     (
                         f"写入 {weekly_stats.written}，重复 {weekly_stats.skipped_duplicates}，"
-                        f"无上新 {weekly_stats.no_data_written}，失败 {weekly_stats.failed}"
+                        f"无上新品牌 {weekly_stats.no_data_brands}（本次新写 {weekly_stats.no_data_written}），"
+                        f"失败 {weekly_stats.failed}"
                     ),
-                    status="failed" if weekly_stats.failed else "success",
-                    error_reason="；".join(weekly_stats.failure_details),
+                    status="skipped" if weekly_stats.skipped else "failed" if weekly_stats.failed else "success",
+                    error_reason=(
+                        weekly_stats.skipped_reason
+                        if weekly_stats.skipped
+                        else "；".join(weekly_stats.failure_details)
+                    ),
                 )
             if context.stop_requested():
                 return
@@ -1026,7 +1180,7 @@ exit `$process.ExitCode
     $actionArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand"
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArgs -WorkingDirectory $runnerDir
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Days -At $AtTime
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
     Register-ScheduledTask -TaskName $TaskName -Description $Description -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 }}
 Register-CompetitorRunnerTask -TaskName "CompetitorMonitor-DailyPrice" -Description "Run daily mature-product price collection and backend WeCom notification" -Mode "daily_price" -Days @("Monday","Tuesday","Wednesday","Thursday","Friday") -AtTime { _ps_quote(daily_time) }
@@ -1093,6 +1247,7 @@ if ($null -ne $task) { Unregister-ScheduledTask -TaskName "CompetitorMonitor-Wee
                 worksheet = excel.find_latest_template_sheet(workbook)
             week = parse_sheet_range(worksheet.title, date.today().year) or get_work_week(date.today())
             layout = excel.detect_layout(worksheet, week.monday)
+            new_product_layout = detect_new_product_layout(worksheet)
             products = excel.list_mature_products(worksheet, layout.model_column, layout.data_start_row)
             if not products:
                 raise ValueError("模板中没有识别到成熟单品链接")
@@ -1101,6 +1256,7 @@ if ($null -ne $task) { Unregister-ScheduledTask -TaskName "CompetitorMonitor-Wee
                 "product_count": len(products),
                 "model_column": layout.model_column,
                 "price_columns": list(layout.date_price_columns),
+                "new_product_start_column": new_product_layout.start_column,
             }
         finally:
             self._close_workbook(workbook)
@@ -1169,6 +1325,92 @@ if ($null -ne $task) { Unregister-ScheduledTask -TaskName "CompetitorMonitor-Wee
 
     def _is_running_locked(self) -> bool:
         return self.status.get("system_status") in {"running", "backfilling", "saving", "sending"}
+
+    def _manual_login_is_running_locked(self) -> bool:
+        return self.get_login_session_status().get("status") == "running"
+
+    def _manual_login_command(self) -> list[str]:
+        arguments = [
+            "--manual-taobao-login",
+            "--runtime-dir",
+            str(self.base_dir),
+            "--config",
+            str(self.config_path),
+            "--login-url",
+            self._manual_taobao_login_url(),
+        ]
+        if getattr(sys, "frozen", False):
+            return [sys.executable, *arguments]
+        return [sys.executable, str(Path(__file__).with_name("web_server.py")), *arguments]
+
+    def _manual_taobao_login_url(self) -> str:
+        fallback = "https://www.tmall.com/"
+        config = self._load_config()
+        configured = str(config.get("taobao_manual_login_url") or "").strip()
+        if _is_taobao_or_tmall_url(configured):
+            return configured
+
+        workbook_path = self._active_workbook_path(config)
+        if not workbook_path.exists():
+            return fallback
+        excel = ExcelService(workbook_path)
+        workbook = None
+        try:
+            workbook = excel.load_workbook()
+            current_sheet = excel.find_sheet_for_date(workbook, self.today_provider())
+            worksheets = []
+            if current_sheet is not None:
+                worksheets.append(current_sheet)
+            if workbook.active not in worksheets:
+                worksheets.append(workbook.active)
+            worksheets.extend(sheet for sheet in reversed(workbook.worksheets) if sheet not in worksheets)
+            for worksheet in worksheets:
+                for product in excel.list_mature_products(worksheet, model_column=2, start_row=4):
+                    if _is_taobao_or_tmall_url(product.url):
+                        return product.url
+        except Exception:
+            return fallback
+        finally:
+            if workbook is not None:
+                try:
+                    workbook.close()
+                except Exception:
+                    pass
+        return fallback
+
+    def _read_manual_login_state(self) -> dict[str, Any]:
+        try:
+            if not self.manual_login_state_path.exists():
+                return {"status": "closed", "auth_status": "checking", "error": None}
+            payload = json.loads(self.manual_login_state_path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {
+                "status": "closed",
+                "auth_status": "checking",
+                "error": None,
+            }
+        except Exception:
+            return {"status": "closed", "auth_status": "checking", "error": None}
+
+    def _write_manual_login_state(
+        self,
+        status: str,
+        pid: int | None = None,
+        error: str | None = None,
+        auth_status: str = "checking",
+    ) -> None:
+        try:
+            atomic_write_json(
+                self.manual_login_state_path,
+                {
+                    "status": status,
+                    "auth_status": auth_status,
+                    "pid": pid,
+                    "updated_at": _now_text(),
+                    "error": error,
+                },
+            )
+        except Exception:
+            pass
 
     def _task_cards(self, config: dict[str, Any], status: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         status = status or self.status
@@ -1336,6 +1578,7 @@ if ($null -ne $task) { Unregister-ScheduledTask -TaskName "CompetitorMonitor-Wee
             "idle": "待命",
             "running": "运行中",
             "success": "成功",
+            "partial_success": "部分成功",
             "failed": "失败",
             "stopped": "已停止",
         }.get(str(status), str(status or "-"))
@@ -1505,6 +1748,23 @@ def _is_secret_key(key: str) -> bool:
 def _is_url_key(key: str) -> bool:
     lower = key.lower()
     return lower in {"url", "link", "商品链接"} or lower.endswith("_url")
+
+
+def _is_taobao_or_tmall_url(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in {"http", "https"} and (
+        host == "taobao.com"
+        or host.endswith(".taobao.com")
+        or host == "tmall.com"
+        or host.endswith(".tmall.com")
+    )
 
 
 def _public_url(value: Any) -> Any:

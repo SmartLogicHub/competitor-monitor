@@ -278,6 +278,39 @@
     return request("/api/session/reset", "POST", { target });
   };
 
+  API.getLoginSessionStatus = async function () {
+    if (API.USE_MOCK) return mockDelay(() => clone(window.CompetitorMonitorMock.loginSession));
+    return request("/api/session/status");
+  };
+
+  API.openTaobaoLogin = async function () {
+    if (API.USE_MOCK) {
+      return mockDelay(() => {
+        window.CompetitorMonitorMock.loginSession = {
+          target: "taobao",
+          status: "running",
+          auth_status: "checking",
+          error: null
+        };
+        return { message: "淘宝登录网页已打开", status: "running" };
+      });
+    }
+    return request("/api/session/open", "POST", { target: "taobao" });
+  };
+
+  API.importTaobaoCookies = async function (file) {
+    if (API.USE_MOCK) {
+      return mockDelay(() => ({
+        message: "Cookie 已导入；真实天猫商品页将在使用时验证登录状态",
+        cookie_count: 1,
+        status: "imported_pending_validation"
+      }));
+    }
+    const form = new FormData();
+    form.append("cookies", file, file.name);
+    return requestForm("/api/session/import-cookies", form);
+  };
+
   function filterLogs(level, query) {
     let list = clone(window.CompetitorMonitorMock.logs);
     if (level && level !== "all") list = list.filter(item => item.level === level);

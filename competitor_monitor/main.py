@@ -1,7 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 import re
 import sys
@@ -15,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from activity_service import ActivityService
 from bi_service import BICollectResult, collect_bi_new_products
-from browser_service import BrowserService
+from browser_service import BrowserService, BrowserSessionUnavailableError
 from collector import ProductCollector
 from config_service import load_config
 from credential_service import load_taobao_credentials
@@ -26,6 +27,7 @@ from new_product_service import get_previous_completed_work_week, is_weekly_new_
 from new_product_writer import (
     NewProductWriteStats,
     detect_new_product_layout,
+    heal_new_product_area,
     list_new_product_brands,
     match_new_product_brand,
     write_new_products,
@@ -147,6 +149,20 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
     return config
 
 
+def price_selection_summary(snapshot) -> str | None:
+    visible_price = getattr(snapshot, "visible_promotion_price", None)
+    sku_price = getattr(snapshot, "sku_candidate_price", None)
+    if not visible_price or not sku_price or visible_price == sku_price:
+        return None
+    selected_price = getattr(snapshot, "price", None)
+    visible_text = getattr(snapshot, "visible_text", "")
+    if selected_price == visible_price:
+        return "页面明确优惠价覆盖SKU候选价"
+    if selected_price == sku_price and ProductCollector.priority_price_is_starting_price(visible_text):
+        return "页面优惠价为起价，保留已确认的SKU价格"
+    return "页面价格候选不一致，已按型号与优惠规则选择最终价格"
+
+
 def run_daily_price_job(
     config,
     logger,
@@ -213,7 +229,7 @@ def run_daily_price_job(
 
     checkpoint = save_every
     if checkpoint is None:
-        checkpoint = int(config.get("save_every_n_products", 5))
+        checkpoint = int(config.get("save_every_n_products", config.get("save_every", 5)))
     stats = run_collection(
         config,
         logger,
@@ -308,18 +324,27 @@ def log_price_trend_stats(logger, stats: PriceTrendWriteStats) -> None:
     logger.info("Price trend skipped unclassified count: %s", stats.skipped_unclassified)
 
 
-def run_weekly_new_products(config, logger, excel, workbook, run_date: date, dry_run: bool, excel_path: Path):
+def run_weekly_new_products(
+    config,
+    logger,
+    excel,
+    workbook,
+    run_date: date,
+    dry_run: bool,
+    excel_path: Path,
+    manual_run: bool = False,
+):
     if not bool(config.get("new_product_enabled", True)):
         logger.info("New product monitoring is disabled; skipping weekly_new")
-        return NewProductWriteStats()
+        return NewProductWriteStats(skipped=True, skipped_reason="new_product_disabled")
     allowed_weekdays = _config_weekdays(config.get("new_product_allowed_weekdays", [5, 6]))
-    if not is_weekly_new_run_day(run_date, allowed_weekdays):
+    if not manual_run and not is_weekly_new_run_day(run_date, allowed_weekdays):
         logger.info(
             "Weekly new-product BI collection skipped on %s; allowed weekdays are %s (Monday=0, Sunday=6)",
             run_date,
             sorted(allowed_weekdays),
         )
-        return NewProductWriteStats()
+        return NewProductWriteStats(skipped=True, skipped_reason="weekday_not_enabled")
     week = get_previous_completed_work_week(run_date)
     sheet_date = week.monday
     worksheet = excel.get_or_create_current_sheet(workbook, sheet_date)
@@ -334,7 +359,16 @@ def run_weekly_new_products(config, logger, excel, workbook, run_date: date, dry
         excel_path=excel_path,
     )
     layout = detect_new_product_layout(worksheet)
+    heal_stats = heal_new_product_area(worksheet, layout)
+    if heal_stats["cleared_urls"] or heal_stats["unmerged_blocks"]:
+        logger.info(
+            "上新区域自动修复：清除残留 URL %s 处，拆掉空白合并块 %s 处",
+            heal_stats["cleared_urls"],
+            heal_stats["unmerged_blocks"],
+        )
     excel_brands = list_new_product_brands(worksheet, layout)
+    if not excel_brands:
+        raise WorkbookLayoutError(f"{worksheet.title} 上新区域未识别到任何品牌，拒绝以空统计结束")
 
     logger.info("Current weekly new-product run time: %s", datetime.now().isoformat(timespec="seconds"))
     logger.info("Current sheet: %s", worksheet.title)
@@ -354,9 +388,20 @@ def run_weekly_new_products(config, logger, excel, workbook, run_date: date, dry
     else:
         collect_result = collect_bi_new_products(config, week, logger=logger)
 
-    products_by_brand = {brand: [] for brand in excel_brands}
-    unmatched_products = 0
     brand_shop_aliases = config.get("new_product_brand_shop_aliases", {})
+    failed_shop_brands: set[str] = set()
+    has_unmatched_failed_shop = False
+    for shop_name in collect_result.failed_shop_names:
+        matched_failed_brand = match_new_product_brand(shop_name, excel_brands, brand_shop_aliases)
+        if matched_failed_brand is None:
+            has_unmatched_failed_shop = True
+        else:
+            failed_shop_brands.add(matched_failed_brand)
+    if has_unmatched_failed_shop:
+        failed_shop_brands.update(excel_brands)
+
+    products_by_brand = {brand: [] for brand in excel_brands if brand not in failed_shop_brands}
+    unmatched_products = 0
     for product in collect_result.products:
         matched_brand = match_new_product_brand(product.brand, excel_brands, brand_shop_aliases)
         if matched_brand is None:
@@ -369,10 +414,12 @@ def run_weekly_new_products(config, logger, excel, workbook, run_date: date, dry
     logger.info("BI raw new-product count: %s", collect_result.total_goods_count)
     logger.info("Matched current-period new-product count: %s", len(collect_result.products))
     logger.info("Unmatched new-product count ignored by Excel brand mapping: %s", unmatched_products)
+    for detail in collect_result.failure_details:
+        logger.warning("BI shop failed detail: %s", detail)
     print_new_product_list(collect_result.products)
 
     if dry_run:
-        return NewProductWriteStats()
+        return NewProductWriteStats(skipped=True, skipped_reason="dry_run")
 
     stats = write_new_products(
         worksheet,
@@ -380,7 +427,17 @@ def run_weekly_new_products(config, logger, excel, workbook, run_date: date, dry
         products_by_brand,
         no_data_text=config.get("new_product_no_data_text", "\u65e0\u4e0a\u65b0"),
         force_overwrite=bool(config.get("force_overwrite_new_products", False)),
+        overwrite_empty_brands=True,
     )
+    if collect_result.failure_details:
+        stats = NewProductWriteStats(
+            written=stats.written,
+            skipped_duplicates=stats.skipped_duplicates,
+            no_data_written=stats.no_data_written,
+            no_data_brands=stats.no_data_brands,
+            failed=stats.failed + len(collect_result.failure_details),
+            failure_details=stats.failure_details + collect_result.failure_details,
+        )
     excel.save_workbook(workbook, excel_path)
     logger.info("New-product written count: %s", stats.written)
     logger.info("New-product duplicate skipped count: %s", stats.skipped_duplicates)
@@ -445,7 +502,7 @@ def ensure_weekly_price_completeness_before_bi(
                 test_one=False,
                 limit=None,
                 row_filter=None,
-                save_every=config.get("save_every_n_products", 5),
+                save_every=config.get("save_every_n_products", config.get("save_every", 5)),
                 excel_path=excel_path,
             )
             if stats.failed:
@@ -546,6 +603,9 @@ def run_collection(
     collector = ProductCollector(
         activity_service,
         blocked_unmatched_sku_fallback_models=config.get("blocked_unmatched_sku_fallback_models"),
+        promotion_content_wait_seconds=config.get("promotion_content_wait_seconds", 10),
+        promotion_content_poll_milliseconds=config.get("promotion_content_poll_milliseconds", 500),
+        promotion_price_stable_reads=config.get("promotion_price_stable_reads", 2),
     )
     target_products = select_target_products(products, test_one=test_one, limit=limit, row_filter=row_filter)
     stats = RunStats(total=len(target_products))
@@ -553,7 +613,6 @@ def run_collection(
     enable_sku_matching = bool(config.get("enable_sku_matching", True))
     allow_ambiguous_sku_collection = bool(config.get("allow_ambiguous_sku_collection", False))
     skip_previous_slash_rows = bool(config.get("skip_when_previous_prices_all_slash", False))
-    fallback_to_previous_price = bool(config.get("fallback_to_previous_price_when_uncertain", False))
     ambiguous_product_keys = find_ambiguous_product_url_keys(products)
     min_delay = int(config.get("min_delay_seconds", 5))
     max_delay = int(config.get("max_delay_seconds", 10))
@@ -671,9 +730,34 @@ def run_collection(
                     retry_count,
                     expected_model=expected_model,
                     allow_fallback_price=not is_ambiguous_product,
+                    empty_price_retry_count=int(config.get("empty_price_retry_count", 1)),
+                    empty_price_retry_min_delay_seconds=float(
+                        config.get("empty_price_retry_min_delay_seconds", 15)
+                    ),
+                    empty_price_retry_max_delay_seconds=float(
+                        config.get("empty_price_retry_max_delay_seconds", 30)
+                    ),
+                    browser_restart_retry_count=int(config.get("browser_restart_retry_count", 2)),
                 )
+                selection_summary = price_selection_summary(snapshot)
+                if selection_summary:
+                    logger.info(
+                        "%s：sheet=%s row=%s 商品=%s 页面优惠价=%s SKU候选价=%s 最终价格=%s "
+                        "promotion_ready=%s body_reads=%s",
+                        selection_summary,
+                        worksheet.title,
+                        product.row,
+                        product.name,
+                        snapshot.visible_promotion_price,
+                        snapshot.sku_candidate_price,
+                        snapshot.price,
+                        getattr(snapshot, "promotion_content_ready", False),
+                        getattr(snapshot, "promotion_body_reads", 1),
+                    )
                 snapshot_visible_text = getattr(snapshot, "visible_text", "")
-                page_model_mismatch = bool(
+                explicitly_unavailable = bool(getattr(snapshot, "explicitly_unavailable", False))
+                specific_model_variant_missing = bool(getattr(snapshot, "model_variant_missing", False))
+                page_model_unconfirmed = bool(
                     expected_model
                     and snapshot_visible_text
                     and ProductCollector.page_misses_required_model_tokens(
@@ -681,11 +765,50 @@ def run_collection(
                         snapshot_visible_text,
                     )
                 )
-                if page_model_mismatch:
+                target_model_replaced = bool(
+                    getattr(snapshot, "target_model_replaced", False)
+                    or (
+                        expected_model
+                        and snapshot_visible_text
+                        and ProductCollector.page_confirms_different_product(
+                            expected_model,
+                            snapshot_visible_text,
+                        )
+                    )
+                )
+                slash_result = explicitly_unavailable or specific_model_variant_missing or target_model_replaced
+                if explicitly_unavailable:
                     activity_value = "/"
-                    price_to_write = None if skip_price else "/"
+                    price_to_write = "/"
                     logger.warning(
-                        "疑似下架或链接失效：sheet=%s row=%s 商品=%s 页面不包含目标型号，写入 /",
+                        "页面明确显示商品已下架或不存在：sheet=%s row=%s 商品=%s，写入 /",
+                        worksheet.title,
+                        product.row,
+                        product.name,
+                    )
+                elif specific_model_variant_missing:
+                    activity_value = "/"
+                    price_to_write = "/"
+                    logger.warning(
+                        "具体礼盒或套餐子型号不存在：sheet=%s row=%s 商品=%s，写入 /",
+                        worksheet.title,
+                        product.row,
+                        product.name,
+                    )
+                elif target_model_replaced:
+                    activity_value = "/"
+                    price_to_write = "/"
+                    logger.warning(
+                        "目标型号已被其他商品替换：sheet=%s row=%s 商品=%s，写入 /",
+                        worksheet.title,
+                        product.row,
+                        product.name,
+                    )
+                elif page_model_unconfirmed:
+                    activity_value = worksheet.cell(row=product.row, column=layout.activity_column).value
+                    price_to_write = None
+                    logger.warning(
+                        "页面未确认目标型号：sheet=%s row=%s 商品=%s；不判定下架，不写入价格",
                         worksheet.title,
                         product.row,
                         product.name,
@@ -696,7 +819,7 @@ def run_collection(
                         snapshot.activities,
                     )
                     price_to_write = None if skip_price else snapshot.price
-                if price_to_write is None and not skip_price:
+                if price_to_write is None and not skip_price and not page_model_unconfirmed:
                     override_price = manual_price_override_for_product(config, product)
                     if override_price is not None:
                         price_to_write = override_price
@@ -707,24 +830,14 @@ def run_collection(
                             product.name,
                             override_price,
                         )
-                if price_to_write is None and not skip_price and fallback_to_previous_price:
-                    price_to_write, fallback_source = latest_historical_fallback_price(
-                        excel,
-                        workbook,
-                        worksheet,
-                        layout,
-                        product,
-                        target_date,
+                if price_to_write is None and not skip_price:
+                    activity_value = worksheet.cell(row=product.row, column=layout.activity_column).value
+                    logger.warning(
+                        "页面未取得可确认价格：sheet=%s row=%s 商品=%s；不使用历史价格替代本次采集结果",
+                        worksheet.title,
+                        product.row,
+                        product.name,
                     )
-                    if price_to_write is not None:
-                        logger.warning(
-                            "使用历史价格兜底：sheet=%s row=%s 商品=%s 来源=%s 历史价格=%s",
-                            worksheet.title,
-                            product.row,
-                            product.name,
-                            fallback_source,
-                            price_to_write,
-                        )
                 correction_warning = None
                 if price_to_write is not None and not skip_price:
                     visible_discount_price = collector.extract_priority_price(getattr(snapshot, "visible_text", ""))
@@ -762,12 +875,13 @@ def run_collection(
                     product,
                     price_to_write,
                     activity_value,
-                    force_overwrite=force_overwrite,
+                    force_overwrite=force_overwrite or slash_result,
                 )
                 if price_to_write is None and not skip_price:
                     logger.warning("价格采集失败：sheet=%s row=%s 商品=%s 链接=%s", worksheet.title, product.row, product.name, product.url)
                     stats.failed += 1
-                    emit_progress(processed_count, product, "failed", error="price_not_collected")
+                    progress_error = "model_not_confirmed" if page_model_unconfirmed else "price_not_collected"
+                    emit_progress(processed_count, product, "failed", error=progress_error)
                 else:
                     stats.success += 1
                     if skip_price and not wrote_price:
@@ -777,6 +891,16 @@ def run_collection(
                     logger.warning("Stop requested after row=%s product=%s; stopping without delay", product.row, product.name)
                     break
                 time.sleep(random.randint(min_delay, max_delay))
+            except BrowserSessionUnavailableError:
+                stats.failed += 1
+                logger.exception(
+                    "浏览器运行时恢复失败，终止本批次：sheet=%s row=%s 商品=%s",
+                    worksheet.title,
+                    product.row,
+                    product.name,
+                )
+                emit_progress(processed_count, product, "failed", error="browser_session_unavailable")
+                raise
             except Exception as exc:
                 stats.failed += 1
                 logger.exception("采集失败：sheet=%s row=%s 商品=%s 链接=%s 原因=%s", worksheet.title, product.row, product.name, product.url, exc)
@@ -1147,23 +1271,74 @@ def collect_with_retry(
     retry_count: int,
     expected_model: str | None = None,
     allow_fallback_price: bool = True,
+    empty_price_retry_count: int = 1,
+    empty_price_retry_min_delay_seconds: float = 15,
+    empty_price_retry_max_delay_seconds: float = 30,
+    browser_restart_retry_count: int = 2,
 ):
     last_error = None
-    for _ in range(retry_count + 1):
+    remaining_exception_retries = max(0, int(retry_count))
+    remaining_empty_price_retries = max(0, int(empty_price_retry_count))
+    remaining_browser_restarts = max(0, int(browser_restart_retry_count))
+    while True:
         page = None
+        retry_after_empty_price = False
         try:
             page = browser.open_page(url)
-            return collector.collect_from_page(
+            snapshot = collector.collect_from_page(
                 page,
                 expected_model=expected_model,
                 allow_fallback_price=allow_fallback_price,
             )
+            conclusive_no_price = bool(getattr(snapshot, "explicitly_unavailable", False)) or bool(
+                getattr(snapshot, "model_variant_missing", False)
+            ) or bool(getattr(snapshot, "target_model_replaced", False))
+            if snapshot.price is not None or conclusive_no_price or remaining_empty_price_retries <= 0:
+                return snapshot
+            remaining_empty_price_retries -= 1
+            retry_after_empty_price = True
         except Exception as exc:
             last_error = exc
+            is_disconnect = bool(
+                hasattr(browser, "is_disconnect_error") and browser.is_disconnect_error(exc)
+            )
+            if is_disconnect:
+                if remaining_browser_restarts <= 0:
+                    raise BrowserSessionUnavailableError(
+                        f"浏览器驱动连接已断开，自动恢复次数已耗尽：{exc}"
+                    ) from exc
+                restart_error: Exception = exc
+                recovered = False
+                while remaining_browser_restarts > 0:
+                    remaining_browser_restarts -= 1
+                    try:
+                        browser.restart_after_disconnect()
+                        recovered = True
+                        break
+                    except Exception as restart_exc:
+                        restart_error = restart_exc
+                if not recovered:
+                    raise BrowserSessionUnavailableError(
+                        f"浏览器驱动连接已断开且重启失败：{restart_error}"
+                    ) from restart_error
+                continue
+            if remaining_exception_retries <= 0:
+                raise
+            remaining_exception_retries -= 1
         finally:
             if page:
-                page.close()
-    raise last_error
+                try:
+                    page.close()
+                except Exception:
+                    pass
+        if retry_after_empty_price:
+            min_delay = max(0.0, float(empty_price_retry_min_delay_seconds))
+            max_delay = max(0.0, float(empty_price_retry_max_delay_seconds))
+            if max_delay < min_delay:
+                min_delay, max_delay = max_delay, min_delay
+            delay = random.uniform(min_delay, max_delay)
+            logging.getLogger(__name__).warning("页面未读到可确认价格，将在 %.1f 秒后低频重试：%s", delay, url)
+            time.sleep(delay)
 
 
 def print_product_list(products) -> None:

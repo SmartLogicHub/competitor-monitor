@@ -389,24 +389,53 @@ class ExcelService:
 
     def prepare_copied_sheet(self, worksheet: Worksheet, target_date: date) -> None:
         week = get_work_week(target_date)
+        week_labels = date_header_labels(week)
         right_start = self._find_header(worksheet, "上新监控", max_row=3, max_col=worksheet.max_column)
         right_start_col = right_start[1] if right_start else None
         date_cells = self._find_mature_date_header_cells(worksheet, right_start_col)
         if len(date_cells) < 5:
             raise WorkbookLayoutError(f"{worksheet.title} 未能识别 5 个成熟单品日期表头")
-        for (row, col), label in zip(date_cells[:5], date_header_labels(week)):
+        for (row, col), label in zip(date_cells[:5], week_labels):
             worksheet.cell(row=row, column=col).value = label
+
+        if right_start_col is not None:
+            live_price_header = self._find_header(
+                worksheet,
+                "直播价格",
+                max_row=6,
+                max_col=worksheet.max_column,
+            )
+            if live_price_header is None or live_price_header[1] < right_start_col:
+                raise WorkbookLayoutError(f"{worksheet.title} 未能识别 BI 直播价格表头")
+            bi_date_row = live_price_header[0] + 1
+            bi_date_start_col = live_price_header[1]
+            if bi_date_start_col + 4 > worksheet.max_column:
+                raise WorkbookLayoutError(f"{worksheet.title} 未能识别 5 个 BI 日期表头")
+            for offset, label in enumerate(week_labels):
+                worksheet.cell(row=bi_date_row, column=bi_date_start_col + offset).value = label
 
         layout = self.detect_layout(worksheet, week.monday)
         clear_columns = set(layout.date_price_columns)
         clear_columns.add(layout.price_status_column)
         clear_columns.add(layout.activity_column)
+        if layout.right_start_column:
+            # Remove leftover "无上新" marker merges so the new week's BI area
+            # starts empty instead of keeping blank merged blocks that later
+            # break new-product row appending (MergedCell value is read-only).
+            for merged_range in list(worksheet.merged_cells.ranges):
+                if (
+                    merged_range.min_col >= layout.right_start_column
+                    and merged_range.min_row >= layout.data_start_row
+                ):
+                    worksheet.unmerge_cells(str(merged_range))
         for row in range(layout.data_start_row, worksheet.max_row + 1):
             for col in clear_columns:
                 worksheet.cell(row=row, column=col).value = None
             if layout.right_start_column:
                 for col in range(layout.right_start_column, worksheet.max_column + 1):
-                    worksheet.cell(row=row, column=col).value = None
+                    cell = worksheet.cell(row=row, column=col)
+                    cell.value = None
+                    cell.hyperlink = None
 
     def detect_layout(self, worksheet: Worksheet, target_date: date) -> SheetLayout:
         right_header = self._find_header(worksheet, "上新监控", max_row=3, max_col=worksheet.max_column)
@@ -463,7 +492,7 @@ class ExcelService:
         layout: SheetLayout,
         product: MatureProduct,
         price: str | None,
-        activity_value: str,
+        activity_value: str | None,
         force_overwrite: bool = False,
     ) -> bool:
         wrote_price = False

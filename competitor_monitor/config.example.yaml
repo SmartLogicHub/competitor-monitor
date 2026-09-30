@@ -7,7 +7,6 @@ price_trend_time: "18:30"
 mode: "daily_price"
 rows: ""
 limit: ""
-save_every: 5
 force_overwrite: false
 
 price_trend_enabled: true
@@ -26,7 +25,7 @@ price_alert_enabled: true
 price_alert_threshold_percent: 20
 price_alert_min_abs_diff: 20
 skip_when_previous_prices_all_slash: false
-fallback_to_previous_price_when_uncertain: true
+fallback_to_previous_price_when_uncertain: false
 
 headless: false
 timeout_ms: 30000
@@ -50,6 +49,15 @@ chrome_major_version: 149
 user_agent: ""
 operation_min_delay_seconds: 3
 operation_max_delay_seconds: 10
+promotion_content_wait_seconds: 10
+promotion_content_poll_milliseconds: 500
+promotion_price_stable_reads: 2
+empty_price_retry_count: 1
+empty_price_retry_min_delay_seconds: 15
+empty_price_retry_max_delay_seconds: 30
+browser_restart_retry_count: 2
+browser_restart_min_delay_seconds: 3
+browser_restart_max_delay_seconds: 8
 
 taobao_login_check_enabled: true
 taobao_login_check_url: "https://www.taobao.com/"
@@ -80,6 +88,9 @@ bi_password_env: "BI_PASSWORD"
 bi_credentials_path: "competitor_monitor/secrets/bi_credentials.json"
 bi_min_delay_seconds: 1
 bi_max_delay_seconds: 3
+bi_request_retry_count: 2
+bi_retry_min_delay_seconds: 2
+bi_retry_max_delay_seconds: 5
 
 wecom_enabled: false
 wecom_webhook: ""

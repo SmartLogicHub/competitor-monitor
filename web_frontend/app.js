@@ -7,6 +7,7 @@
     tasks: null,
     completeness: null,
     config: null,
+    loginSession: { target: "taobao", status: "closed", auth_status: "checking", error: null },
     logs: [],
     results: [],
     resultQuick: "all",
@@ -40,6 +41,7 @@
     document.getElementById("btn-refresh").addEventListener("click", refreshAll);
     document.getElementById("btn-run-daily").addEventListener("click", () => handleTaskPrimary("daily_price"));
     document.getElementById("btn-run-weekly").addEventListener("click", () => handleTaskPrimary("weekly_new"));
+    document.getElementById("btn-rerun-weekly").addEventListener("click", rerunLastWeekly);
     document.getElementById("btn-stop-task").addEventListener("click", stopTask);
     document.getElementById("btn-backfill-missing").addEventListener("click", backfillMissingDates);
     document.getElementById("btn-loop-primary").addEventListener("click", handleLoopPrimaryAction);
@@ -71,6 +73,8 @@
       event.returnValue = "";
     });
     document.getElementById("btn-reset-taobao").addEventListener("click", () => resetSession("taobao"));
+    document.getElementById("btn-open-taobao-login").addEventListener("click", openTaobaoLogin);
+    document.getElementById("btn-import-taobao-cookies").addEventListener("click", importTaobaoCookies);
     document.getElementById("btn-reset-bi").addEventListener("click", () => resetSession("bi"));
     document.getElementById("btn-close-detail").addEventListener("click", closeDetail);
     document.querySelectorAll(".btn-toggle-password").forEach(button => {
@@ -97,12 +101,12 @@
   }
 
   async function refreshAll() {
-    await Promise.allSettled([loadStatus(), loadCompleteness(), loadConfig(), loadLogs(), loadResults()]);
+    await Promise.allSettled([loadStatus(), loadLoginSessionStatus(), loadCompleteness(), loadConfig(), loadLogs(), loadResults()]);
   }
 
   async function refreshStatusOnly() {
     state.pollTick += 1;
-    const tasks = [loadStatus()];
+    const tasks = [loadStatus(), loadLoginSessionStatus()];
     if (state.pollTick % 4 === 0) {
       tasks.push(loadLogs(), loadResults());
     }
@@ -115,6 +119,11 @@
   async function loadStatus() {
     state.tasks = await API.getTasksStatus();
     renderStatus();
+  }
+
+  async function loadLoginSessionStatus() {
+    state.loginSession = await API.getLoginSessionStatus();
+    renderLoginSessionStatus();
   }
 
   async function loadCompleteness() {
@@ -227,7 +236,44 @@
     setDisabled("btn-run-weekly", running && activeTask !== "weekly_new" || stopRequested);
     setDisabled("btn-stop-task", !running || stopRequested);
     setDisabled("btn-backfill-missing", running);
+    setDisabled("btn-rerun-weekly", running);
     setDisabled("btn-loop-primary", running);
+    renderLoginSessionStatus();
+  }
+
+  function renderLoginSessionStatus() {
+    const session = state.loginSession || {};
+    const data = state.tasks || {};
+    const loginOpen = session.status === "running";
+    const authStatus = session.auth_status || "checking";
+    const authLabels = {
+      checking: "正在检查淘宝登录状态",
+      login_required: "淘宝尚未登录",
+      manual_action_required: "淘宝需要人工验证",
+      authenticated: "淘宝已登录"
+    };
+    const taskRunning = UIState.isLiveStatus(data.system_status);
+    const activeTask = UIState.activeTaskId(data);
+    const stopRequested = Boolean(data.stop_requested);
+    let browserStatusText = loginOpen
+      ? authLabels[authStatus] || authLabels.checking
+      : authStatus === "authenticated"
+        ? "淘宝已登录（登录浏览器已关闭）"
+        : "登录浏览器已关闭";
+    if (session.status === "failed") browserStatusText = "登录浏览器启动失败";
+    text(
+      "taobao-login-browser-status",
+      browserStatusText
+    );
+    const sessionStatus = document.getElementById("taobao-login-browser-status");
+    if (sessionStatus) sessionStatus.title = session.error || "";
+    setDisabled("btn-open-taobao-login", loginOpen || taskRunning);
+    setDisabled("btn-reset-taobao", loginOpen || taskRunning);
+    setDisabled("btn-run-daily", loginOpen || (taskRunning && activeTask !== "daily_price") || stopRequested);
+    setDisabled("btn-run-weekly", loginOpen || (taskRunning && activeTask !== "weekly_new") || stopRequested);
+    setDisabled("btn-backfill-missing", loginOpen || taskRunning);
+    setDisabled("btn-rerun-weekly", loginOpen || taskRunning);
+    setDisabled("btn-loop-primary", loginOpen || taskRunning);
   }
 
   function setTaskCardRunning(cardId, noteId, running, data = {}, progressPercent = 0) {
@@ -336,7 +382,7 @@
     placeholder("cfg-bi-username", config.bi_username_masked ? `已保存：${config.bi_username_masked}` : "需要修改时填写");
     placeholder("cfg-bi-password", config.bi_password_set ? "已保存：******" : "需要修改时填写");
     value("cfg-mode", config.mode || "daily_price");
-    value("cfg-run-date", config.run_date || defaultRunDate());
+    value("cfg-run-date", defaultRunDate());
     value("cfg-dry-run", String(Boolean(config.dry_run)));
     value("cfg-test-one", String(Boolean(config.test_one)));
     value("cfg-rows", config.rows || "");
@@ -403,6 +449,10 @@
     const data = state.tasks || {};
     const running = UIState.isLiveStatus(data.system_status);
     const activeTask = UIState.activeTaskId(data);
+    if ((state.loginSession || {}).status === "running") {
+      toast("淘宝登录网页正在打开，请先关闭登录浏览器再运行采集", "warning");
+      return;
+    }
     if (running && activeTask === mode) {
       await stopTask(mode === "weekly_new" ? "btn-run-weekly" : "btn-run-daily");
       return;
@@ -414,13 +464,30 @@
     await runTask(mode);
   }
 
-  async function runTask(mode) {
-    const payload = buildRunPayload(mode);
-    await withButtonLoading(mode === "weekly_new" ? "btn-run-weekly" : "btn-run-daily", async () => {
+  async function runTask(mode, runDate, buttonId) {
+    const payload = buildRunPayload(mode, runDate);
+    const loadingButton = buttonId || (mode === "weekly_new" ? "btn-run-weekly" : "btn-run-daily");
+    await withButtonLoading(loadingButton, async () => {
       await API.runTask(payload);
       toast("任务已提交，页面会自动刷新状态", "success");
       await refreshAll();
     });
+  }
+
+  async function rerunLastWeekly() {
+    const data = state.tasks || {};
+    if ((state.loginSession || {}).status === "running") {
+      toast("淘宝登录网页正在打开，请先关闭登录浏览器再运行采集", "warning");
+      return;
+    }
+    if (UIState.isLiveStatus(data.system_status)) {
+      toast("已有任务正在运行，请先停止或等待完成", "warning");
+      return;
+    }
+    const runDate = lastSaturdayDate();
+    const weekLabel = previousWeekLabel(runDate);
+    if (!confirm(`确认补跑上次 BI 上新？\n\n运行日期：${runDate}\n目标周期：${weekLabel}\n\n补跑会启动后端任务，运行中不能重复启动。`)) return;
+    await runTask("weekly_new", runDate, "btn-rerun-weekly");
   }
 
   async function downloadTemplate(buttonId = "btn-download-template") {
@@ -526,7 +593,6 @@
       wecom_send_excel_file: document.getElementById("cfg-wecom-template").value === "true",
       excel_path: document.getElementById("cfg-excel-path").value.trim(),
       mode: document.getElementById("cfg-mode").value,
-      run_date: document.getElementById("cfg-run-date").value,
       dry_run: document.getElementById("cfg-dry-run").value === "true",
       test_one: document.getElementById("cfg-test-one").value === "true",
       rows: document.getElementById("cfg-rows").value.trim(),
@@ -582,16 +648,56 @@
     await loadConfig();
   }
 
-  function buildRunPayload(mode) {
+  async function openTaobaoLogin() {
+    if (UIState.isLiveStatus((state.tasks || {}).system_status)) {
+      toast("采集任务正在运行，请先停止或等待任务完成", "warning");
+      return;
+    }
+    let response = null;
+    await withButtonLoading("btn-open-taobao-login", async () => {
+      response = await API.openTaobaoLogin();
+    });
+    if (!response) return;
+    await loadLoginSessionStatus();
+    toast(response.message || "淘宝登录网页已打开", response.error ? "warning" : "success");
+  }
+
+  async function importTaobaoCookies() {
+    if (UIState.isLiveStatus((state.tasks || {}).system_status)) {
+      toast("采集任务正在运行，请先停止或等待任务完成", "warning");
+      return;
+    }
+    const input = document.getElementById("taobao-cookie-upload-input");
+    const file = input.files && input.files[0];
+    if (!file) {
+      toast("请先选择 Cookie JSON 文件", "warning");
+      return;
+    }
+    if (!file.name.toLowerCase().endsWith(".json")) {
+      toast("Cookie 文件必须是 .json 格式", "warning");
+      return;
+    }
+    let response = null;
+    await withButtonLoading("btn-import-taobao-cookies", async () => {
+      response = await API.importTaobaoCookies(file);
+    });
+    if (!response) return;
+    if (!response.error) input.value = "";
+    toast(response.message || "Cookie 导入完成", response.error ? "warning" : "success");
+    await loadConfig();
+  }
+
+  function buildRunPayload(mode, runDate) {
     const payload = {
       mode,
-      run_date: document.getElementById("cfg-run-date").value || defaultRunDate(),
+      manual_run: true,
       dry_run: document.getElementById("cfg-dry-run").value === "true",
       test_one: document.getElementById("cfg-test-one").value === "true",
       rows: document.getElementById("cfg-rows").value.trim(),
       limit: document.getElementById("cfg-limit").value,
       save_every: Number(document.getElementById("cfg-save-every").value || 0)
     };
+    if (runDate) payload.run_date = runDate;
     Object.keys(payload).forEach(key => {
       if (payload[key] === "" || payload[key] === 0) delete payload[key];
     });
@@ -599,7 +705,39 @@
   }
 
   function defaultRunDate() {
-    return window.CompetitorMonitorMock ? window.CompetitorMonitorMock.today : new Date().toISOString().slice(0, 10);
+    if (window.CompetitorMonitorMock) return window.CompetitorMonitorMock.today;
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = String(today.getMonth() + 1).padStart(2, "0");
+    const day = String(today.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function formatLocalDate(d) {
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  // 最近的一个周六：用它作为 run_date 会通过 weekly_new 的周六/周日运行限制，
+  // 并让后端 get_previous_completed_work_week 定位到上一个完整工作周。
+  function lastSaturdayDate() {
+    const d = new Date();
+    const diff = (d.getDay() + 1) % 7; // 0=周日..6=周六；距离上一个周六的天数
+    d.setDate(d.getDate() - diff);
+    return formatLocalDate(d);
+  }
+
+  // 由「上一个周六」反推目标周期标签，例如 2026-08-22 -> "8.17-8.21"
+  function previousWeekLabel(saturdayIso) {
+    const sat = new Date(`${saturdayIso}T00:00:00`);
+    const fri = new Date(sat);
+    fri.setDate(fri.getDate() - 1);
+    const mon = new Date(fri);
+    mon.setDate(mon.getDate() - 4);
+    const fmt = (dt) => `${dt.getMonth() + 1}.${dt.getDate()}`;
+    return `${fmt(mon)}-${fmt(fri)}`;
   }
 
   function openDetail(id) {

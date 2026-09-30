@@ -70,7 +70,7 @@ function Register-CompetitorTask {
         [Microsoft.Management.Infrastructure.CimInstance]$Trigger
     )
 
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
     Register-ScheduledTask -TaskName $TaskName -Description $Description -Action $Action -Trigger $Trigger -Settings $settings -Force | Out-Null
     Write-Host "Registered: $TaskName"
 }

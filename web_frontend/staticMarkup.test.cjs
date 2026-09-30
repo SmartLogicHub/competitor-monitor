@@ -49,6 +49,8 @@ test("automation page keeps only real local tool controls", () => {
   assert.doesNotMatch(html, /class="card-overlay"/);
   assert.doesNotMatch(app, /daily-overlay|weekly-overlay/);
   assert.match(html, /id="cfg-taobao-login-status"/);
+  assert.match(html, /id="taobao-cookie-upload-input"/);
+  assert.match(html, /id="btn-import-taobao-cookies"/);
   assert.match(html, /id="cfg-bi-login-status"/);
   assert.match(html, /class="today-workbench/);
   assert.match(html, /class="workbench-primary/);
@@ -58,6 +60,7 @@ test("automation page keeps only real local tool controls", () => {
   assert.match(html, /id="btn-run-daily"/);
   assert.match(html, /id="btn-run-weekly"/);
   assert.match(app, /function handleTaskPrimary\(mode\)/);
+  assert.match(app, /function buildRunPayload\(mode, runDate\)[\s\S]*manual_run:\s*true/);
   assert.match(app, /btn-run-daily"\)\.addEventListener\("click",\s*\(\)\s*=>\s*handleTaskPrimary\("daily_price"\)\)/);
   assert.match(app, /btn-run-weekly"\)\.addEventListener\("click",\s*\(\)\s*=>\s*handleTaskPrimary\("weekly_new"\)\)/);
   assert.doesNotMatch(app, /btn-run-daily"\)\.addEventListener\("click",\s*\(\)\s*=>\s*runTask\("daily_price"\)\)/);

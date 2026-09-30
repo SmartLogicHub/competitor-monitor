@@ -7,6 +7,12 @@ import run_web_task
 
 
 class RunWebTaskTest(unittest.TestCase):
+    def test_task_exit_codes_distinguish_partial_failure_and_stop(self):
+        self.assertEqual(run_web_task.task_exit_code("success"), 0)
+        self.assertEqual(run_web_task.task_exit_code("failed"), 1)
+        self.assertEqual(run_web_task.task_exit_code("partial_success"), 2)
+        self.assertEqual(run_web_task.task_exit_code("stopped"), 3)
+
     def test_runtime_base_dir_can_be_overridden_for_shared_web_runtime(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict("os.environ", {"COMPETITOR_MONITOR_RUNTIME_DIR": tmpdir}):

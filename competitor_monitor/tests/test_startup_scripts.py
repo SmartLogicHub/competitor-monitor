@@ -50,6 +50,8 @@ class StartupScriptsTest(unittest.TestCase):
         self.assertIn("-EncodedCommand $encodedCommand", install_text)
         self.assertIn("Start-Process -FilePath", install_text)
         self.assertIn("-WindowStyle Hidden -Wait -PassThru", install_text)
+        self.assertIn("-RestartCount 3", install_text)
+        self.assertIn("-RestartInterval (New-TimeSpan -Minutes 10)", install_text)
         self.assertNotIn('New-ScheduledTaskAction -Execute $runnerExe -Argument $exeArgument', install_text)
         self.assertNotIn("New-ScheduledTaskPrincipal", install_text)
         self.assertNotIn("RunLevel LeastPrivilege", install_text)

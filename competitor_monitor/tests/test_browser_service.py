@@ -21,6 +21,102 @@ from credential_service import AccountCredentials
 
 
 class BrowserServiceConfigTest(unittest.TestCase):
+    def test_detects_driver_connection_closed_as_restartable_disconnect(self):
+        error = RuntimeError("BrowserContext.new_page: Connection closed while reading from the driver")
+
+        self.assertTrue(BrowserService.is_disconnect_error(error))
+
+    def test_restart_after_disconnect_replaces_runtime_and_rechecks_login(self):
+        service = BrowserService(
+            headless=True,
+            timeout_ms=1000,
+            context_config={
+                "browser_restart_min_delay_seconds": 0,
+                "browser_restart_max_delay_seconds": 0,
+                "taobao_login_check_enabled": True,
+            },
+        )
+
+        with patch.object(service, "_stop_runtime") as stop_runtime, patch.object(
+            service, "_start_runtime"
+        ) as start_runtime, patch.object(service, "ensure_taobao_login") as ensure_login:
+            service.restart_after_disconnect()
+
+        stop_runtime.assert_called_once_with()
+        start_runtime.assert_called_once_with()
+        ensure_login.assert_called_once_with()
+
+    def test_manual_page_auth_state_reuses_existing_detector_without_navigation(self):
+        class FakeLocator:
+            def inner_text(self, timeout):
+                return "亲，请登录"
+
+        class FakePage:
+            url = "https://www.taobao.com/"
+
+            def title(self):
+                return "淘宝网"
+
+            def locator(self, selector):
+                self.selector = selector
+                return FakeLocator()
+
+        page = FakePage()
+        service = BrowserService(headless=False, timeout_ms=1000)
+
+        auth_status = service.get_manual_page_auth_state(page)
+
+        self.assertEqual(auth_status, "login_required")
+        self.assertEqual(page.selector, "body")
+
+    def test_manual_login_page_uses_existing_context_without_auth_recovery(self):
+        calls = []
+
+        class FakePage:
+            def goto(self, url, **kwargs):
+                calls.append((url, kwargs))
+
+        class FakeContext:
+            def __init__(self):
+                self.pages = [FakePage()]
+
+            def new_page(self):
+                return FakePage()
+
+            def storage_state(self, path):
+                calls.append(("storage_state", path))
+
+        service = BrowserService(headless=False, timeout_ms=4321, user_data_dir="profile")
+        service._context = FakeContext()
+
+        page = service.open_manual_page("https://www.taobao.com/")
+        saved = service.persist_storage_state()
+
+        self.assertIsInstance(page, FakePage)
+        self.assertEqual(calls[0][0], "https://www.taobao.com/")
+        self.assertEqual(calls[0][1]["timeout"], 4321)
+        self.assertTrue(service.has_open_pages())
+        self.assertTrue(saved)
+
+    def test_context_manager_ignores_already_closed_browser_during_cleanup(self):
+        stopped = []
+
+        class ClosedContext:
+            def close(self):
+                raise RuntimeError("Target page, context or browser has been closed")
+
+        class FakePlaywright:
+            def stop(self):
+                stopped.append(True)
+
+        service = BrowserService(headless=False, timeout_ms=1000)
+        service._context = ClosedContext()
+        service._playwright = FakePlaywright()
+
+        service.__exit__(None, None, None)
+
+        self.assertEqual(stopped, [True])
+
     def test_browser_launch_args_include_standard_stability_flags(self):
         args = build_browser_launch_args()
 

@@ -30,6 +30,9 @@ class BICollectResult:
     total_shop_count: int
     queried_shop_count: int
     total_goods_count: int
+    successful_shop_names: tuple[str, ...] = ()
+    failed_shop_names: tuple[str, ...] = ()
+    failure_details: tuple[str, ...] = ()
 
 
 def build_week_payload(week: WorkWeek, platform: str = DEFAULT_PLATFORM, days_type: int = 7) -> dict[str, Any]:
@@ -132,13 +135,24 @@ class BINewProductClient:
 
         all_products: list[NewProduct] = []
         total_goods_count = 0
+        successful_shop_names: list[str] = []
+        failed_shop_names: list[str] = []
+        failure_details: list[str] = []
         for shop in queried_shops:
             shop_id = str(shop.get("shopId") or shop.get("id") or "").strip()
             if not shop_id:
                 continue
+            shop_name = str(shop.get("shopName") or shop.get("name") or shop_id).strip()
             goods_payload = {**payload, "shopId": shop_id}
-            goods_response = self.post_json(page, NEW_GOODS_ENDPOINT, goods_payload)
-            goods_rows = extract_response_data(goods_response, NEW_GOODS_ENDPOINT)
+            try:
+                goods_rows = self._query_shop_goods_with_retry(page, goods_payload, shop_name)
+            except Exception as exc:
+                failed_shop_names.append(shop_name)
+                detail = f"{shop_name}: {exc}"
+                failure_details.append(detail)
+                self._log_warning(f"BI 上新店铺查询失败，已跳过该店继续：{detail}")
+                continue
+            successful_shop_names.append(shop_name)
             total_goods_count += len(goods_rows)
             all_products.extend(normalize_shop_goods(shop, goods_rows, week))
             self._log_info(f"BI 上新店铺 {shop.get('shopName')} 原始 {len(goods_rows)} 条，周期内 {len(all_products)} 条累计")
@@ -149,7 +163,27 @@ class BINewProductClient:
             total_shop_count=len(shops),
             queried_shop_count=len(queried_shops),
             total_goods_count=total_goods_count,
+            successful_shop_names=tuple(successful_shop_names),
+            failed_shop_names=tuple(failed_shop_names),
+            failure_details=tuple(failure_details),
         )
+
+    def _query_shop_goods_with_retry(self, page, payload: dict[str, Any], shop_name: str) -> list[dict[str, Any]]:
+        retry_count = max(0, int(self.config.get("bi_request_retry_count", 2)))
+        for attempt in range(retry_count + 1):
+            try:
+                goods_response = self.post_json(page, NEW_GOODS_ENDPOINT, payload)
+                return extract_response_data(goods_response, NEW_GOODS_ENDPOINT)
+            except Exception:
+                if attempt >= retry_count:
+                    raise
+                self._log_warning(
+                    f"BI 上新店铺 {shop_name} 请求失败，准备第 {attempt + 2}/{retry_count + 1} 次尝试"
+                )
+                min_delay = float(self.config.get("bi_retry_min_delay_seconds", 2))
+                max_delay = float(self.config.get("bi_retry_max_delay_seconds", 5))
+                random_delay(max(0.0, min_delay), max(0.0, max_delay))
+        return []
 
     def ensure_logged_in(self, page) -> None:
         page.goto(self.new_monitoring_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
@@ -275,3 +309,7 @@ class BINewProductClient:
     def _log_info(self, message: str) -> None:
         if self.logger:
             self.logger.info("%s %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message)
+
+    def _log_warning(self, message: str) -> None:
+        if self.logger:
+            self.logger.warning("%s %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message)

@@ -25,6 +25,41 @@ class ProductCollectorTest(unittest.TestCase):
 
         self.assertFalse(missing)
 
+    def test_page_model_presence_recognizes_controlled_marketing_alias(self):
+        visible_text = (
+            "Shokz韶音OpenDots ONE耳夹耳机 "
+            "参数信息 型号 OpenDots ONE 品名 E310 店铺优惠后 ￥998"
+        )
+
+        missing = ProductCollector.page_misses_required_model_tokens("动钛圈", visible_text)
+
+        self.assertFalse(missing)
+
+    def test_page_model_presence_does_not_treat_different_model_as_alias(self):
+        visible_text = "绿联Q3蓝牙耳机 参数信息 型号 WS212 ￥439"
+
+        missing = ProductCollector.page_misses_required_model_tokens("T3pro", visible_text)
+
+        self.assertTrue(missing)
+
+    def test_page_confirms_target_was_replaced_when_loaded_details_name_another_model(self):
+        visible_text = (
+            "绿联Q3蓝牙耳机主动降噪入耳式无线耳机\n"
+            "参数信息\n品牌\n绿联\n型号\nWS212\n"
+            "图文详情\n绿联Q3蓝牙耳机\n￥\n439\n热卖中"
+        )
+
+        replaced = ProductCollector.page_confirms_different_product("T3pro", visible_text)
+
+        self.assertTrue(replaced)
+
+    def test_page_does_not_confirm_replacement_from_incomplete_generic_text(self):
+        visible_text = "其他型号耳机 店铺优惠后 ￥2999"
+
+        replaced = ProductCollector.page_confirms_different_product("WH-1000XM5", visible_text)
+
+        self.assertFalse(replaced)
+
     def test_extracts_platform_subsidy_price_first(self):
         text = "页面主价格 ￥399 平台加补后 ￥268.52 起 到手价 ￥288"
 
@@ -74,6 +109,45 @@ class ProductCollectorTest(unittest.TestCase):
         self.assertIsNone(snapshot.price)
         self.assertEqual(page.clicked_options, [])
 
+    def test_numbered_single_model_page_uses_title_price_when_skus_are_only_colors(self):
+        page = FakeSkuPage(
+            {"黑色": "1699", "银色": "1699"},
+            base_text="Sony WH-1000XM5 店铺优惠后 ￥1699",
+        )
+
+        snapshot = self.collector.collect_from_page(page, expected_model="WH-1000XM5")
+
+        self.assertFalse(snapshot.model_variant_missing)
+        self.assertEqual(snapshot.price, "1699")
+
+    def test_ordinary_numbered_models_do_not_require_numbers_in_sku_options(self):
+        for model in ("A30S PRO", "W04", "WH-CH520"):
+            with self.subTest(model=model):
+                self.assertEqual(ProductCollector.specific_model_variant_tokens(model), [])
+
+    def test_page_with_explicit_delisting_marker_is_classified_as_unavailable(self):
+        page = FakeSkuPage({}, base_text="很抱歉，此商品已下架")
+
+        snapshot = self.collector.collect_from_page(page, expected_model="WH-1000XM5")
+
+        self.assertTrue(hasattr(snapshot, "explicitly_unavailable"))
+        self.assertTrue(snapshot.explicitly_unavailable)
+
+    def test_page_with_already_delisted_banner_ignores_stale_price(self):
+        page = FakeSkuPage(
+            {},
+            base_text=(
+                "【国家补贴】Sony/索尼 WH-1000XM4 头戴式无线蓝牙耳机 "
+                "￥2499 领取政府补贴15% "
+                "商品已经下架啦~要不要瞧瞧别的~"
+            ),
+        )
+
+        snapshot = self.collector.collect_from_page(page, expected_model="WH-1000XM4")
+
+        self.assertTrue(snapshot.explicitly_unavailable)
+        self.assertIsNone(snapshot.price)
+
     def test_collects_prices_from_tmall_initial_sku_data_without_clicking(self):
         page = FakeInitialDataPage(
             build_tmall_initial_sku_html(
@@ -107,6 +181,116 @@ class ProductCollectorTest(unittest.TestCase):
 
         self.assertEqual(snapshot.price, "268.52")
         self.assertEqual(page.clicked_options, [])
+
+    def test_keeps_matching_sku_price_when_visible_promotion_is_only_a_starting_price(self):
+        page = FakeInitialDataPage(
+            build_tmall_initial_sku_html(
+                [("1627207:s7s-ultra-black", "sku-s7s-ultra-black")],
+                {"1627207:s7s-ultra-black": "S7S Ultra black"},
+                {"sku-s7s-ultra-black": "488.41"},
+            ),
+            base_text="S7S Ultra \u5e73\u53f0\u52a0\u8865\u540e \uffe5391.76 \u8d77",
+        )
+
+        snapshot = self.collector.collect_from_page(page, expected_model="S7S Ultra")
+
+        self.assertEqual(snapshot.visible_promotion_price, "391.76")
+        self.assertEqual(snapshot.sku_candidate_price, "488.41")
+        self.assertEqual(snapshot.price, "488.41")
+
+    def test_waits_for_delayed_promotion_without_using_its_starting_price_for_sku(self):
+        page = FakeDelayedPromotionInitialDataPage(
+            build_tmall_initial_sku_html(
+                [("5919063:6536025;1627207:t6-white", "sku-t6-white")],
+                {
+                    "5919063:6536025": "官方标配",
+                    "1627207:t6-white": "T6magic白色",
+                },
+                {"sku-t6-white": "279"},
+            ),
+            body_texts=[
+                "绿联 T6magic 入耳式降噪耳机",
+                "绿联 T6magic 入耳式降噪耳机",
+                "绿联 T6magic 平台加补后 ￥170起 超级立减 首单礼金",
+            ],
+        )
+        collector = ProductCollector(
+            ActivityService({"超级立减": ["超级立减"], "首单礼金": ["首单礼金"]})
+        )
+
+        snapshot = collector.collect_from_page(page, expected_model="T6magic")
+
+        self.assertEqual(snapshot.visible_promotion_price, "170")
+        self.assertEqual(snapshot.sku_candidate_price, "279")
+        self.assertEqual(snapshot.price, "279")
+        self.assertEqual(snapshot.activities, ["超级立减", "首单礼金"])
+        self.assertGreaterEqual(page.body_read_count, 3)
+
+    def test_waits_for_delayed_initial_sku_price_when_no_labeled_promotion_appears(self):
+        delayed_sku_html = build_tmall_initial_sku_html(
+            [("1627207:s7s-black", "sku-s7s-black")],
+            {"1627207:s7s-black": "S7S black"},
+            {"sku-s7s-black": "820"},
+        )
+        page = FakeDelayedSkuDataPage(
+            htmls=["<html></html>", "<html></html>", delayed_sku_html, delayed_sku_html],
+            body_texts=["S7S wireless earphone"] * 4,
+        )
+
+        collector = ProductCollector(
+            self.collector.activity_service,
+            sku_price_settle_reads=4,
+        )
+
+        snapshot = collector.collect_from_page(page, expected_model="S7S")
+
+        self.assertEqual(snapshot.price, "820")
+        self.assertEqual(snapshot.sku_candidate_price, "820")
+        self.assertTrue(snapshot.promotion_content_ready)
+        self.assertEqual(snapshot.promotion_body_reads, 6)
+
+    def test_waits_through_early_activity_for_later_labeled_promotion_price(self):
+        page = FakeDelayedPromotionInitialDataPage(
+            build_tmall_initial_sku_html(
+                [("5919063:6536025;1627207:ch520-white", "sku-ch520-white")],
+                {
+                    "5919063:6536025": "官方标配",
+                    "1627207:ch520-white": "WH-CH520白色",
+                },
+                {"sku-ch520-white": "499"},
+            ),
+            body_texts=[
+                "索尼 WH-CH520 国补",
+                "索尼 WH-CH520 国补",
+                "索尼 WH-CH520 国补 店铺优惠后 ￥329",
+            ],
+        )
+        collector = ProductCollector(ActivityService({"国补": ["国补"]}))
+
+        snapshot = collector.collect_from_page(page, expected_model="WH-CH520")
+
+        self.assertEqual(snapshot.price, "329")
+        self.assertEqual(snapshot.activities, ["国补"])
+        self.assertEqual(page.body_read_count, 4)
+
+    def test_keeps_sku_base_price_after_promotion_wait_times_out(self):
+        page = FakeDelayedPromotionInitialDataPage(
+            build_tmall_initial_sku_html(
+                [("5919063:6536025;1627207:t6-white", "sku-t6-white")],
+                {
+                    "5919063:6536025": "官方标配",
+                    "1627207:t6-white": "T6magic白色",
+                },
+                {"sku-t6-white": "279"},
+            ),
+            body_texts=["绿联 T6magic 入耳式降噪耳机"],
+        )
+
+        snapshot = self.collector.collect_from_page(page, expected_model="T6magic")
+
+        self.assertEqual(snapshot.price, "279")
+        self.assertEqual(snapshot.activities, ["/"])
+        self.assertGreater(page.body_read_count, 2)
 
     def test_click_path_selects_standard_package_before_model_option(self):
         page = FakePackageSkuPage(
@@ -206,6 +390,22 @@ class ProductCollectorTest(unittest.TestCase):
         snapshot = self.collector.collect_from_page(page, expected_model="A5")
 
         self.assertIsNone(snapshot.price)
+        self.assertEqual(page.clicked_options, [])
+
+    def test_title_confirmed_risky_short_model_accepts_non_starting_labeled_page_price(self):
+        page = FakeSkuPage(
+            {
+                "[Ultra\u9ed1]\u5f71\u9662\u5168\u666f\u97f3": "124",
+                "[\u9876\u914d\u767d]HiFi\u7ea7\u97f3\u8d28": "79.9",
+                "[\u81f3\u5c0a\u767d]\u675c\u6bd4\u5168\u666f\u73af\u7ed5": "109.65",
+            },
+            base_text="\u653f\u5e9c\u8865\u8d34\u91d1\u8fd0A5\u84dd\u7259\u8033\u673a \u5e73\u53f0\u52a0\u8865\u540e \uffe579.9 \u4f18\u60e0\u524d \uffe5124",
+        )
+
+        snapshot = self.collector.collect_from_page(page, expected_model="A5")
+
+        self.assertEqual(snapshot.price, "79.9")
+        self.assertEqual(snapshot.visible_promotion_price, "79.9")
         self.assertEqual(page.clicked_options, [])
 
     def test_unique_short_model_without_sku_options_can_use_page_default_price(self):
@@ -314,6 +514,119 @@ class ProductCollectorTest(unittest.TestCase):
 
         self.assertEqual([(option.text, option.price) for option in options], [("\u3010\u767d\u8272\u3011\u5f71\u9662\u7ea7\u7a7a\u95f4\u97f3\u9891\u2605\u4e91\u611f\u6c14\u56ca", "119")])
 
+    def test_base_model_uses_non_pro_non_ultra_sku_under_standard_package(self):
+        html = build_tmall_initial_sku_html(
+            [
+                ("5919063:standard;1627207:ai2-black", "sku-ai2-black"),
+                ("5919063:standard;1627207:ultra-black", "sku-ultra-black"),
+            ],
+            {
+                "5919063:standard": "\u5b98\u65b9\u6807\u914d",
+                "1627207:ai2-black": "AI2\u5e7d\u96fe\u9ed1",
+                "1627207:ultra-black": "Ultra\u5e7d\u96fe\u9ed1",
+            },
+            {"sku-ai2-black": "396.1", "sku-ultra-black": "488.41"},
+        )
+
+        price = self.collector.collect_prices_from_initial_sku_data(
+            FakeInitialDataPage(html),
+            "S7S",
+        )
+
+        self.assertEqual(price, "396.1")
+
+    def test_ultra_model_matches_ultra_sku_when_base_model_name_is_not_repeated(self):
+        html = build_tmall_initial_sku_html(
+            [
+                ("5919063:standard;1627207:ai2-black", "sku-ai2-black"),
+                ("5919063:standard;1627207:ultra-black", "sku-ultra-black"),
+            ],
+            {
+                "5919063:standard": "\u5b98\u65b9\u6807\u914d",
+                "1627207:ai2-black": "AI2\u5e7d\u96fe\u9ed1",
+                "1627207:ultra-black": "Ultra\u5e7d\u96fe\u9ed1",
+            },
+            {"sku-ai2-black": "396.1", "sku-ultra-black": "488.41"},
+        )
+
+        price = self.collector.collect_prices_from_initial_sku_data(
+            FakeInitialDataPage(html),
+            "S7S Ultra",
+        )
+
+        self.assertEqual(price, "488.41")
+
+    def test_gift_box_model_prefers_matching_gift_package_but_keeps_ultra_match_rule(self):
+        html = build_tmall_initial_sku_html(
+            [
+                ("5919063:standard;1627207:ultra-black", "sku-standard-ultra"),
+                ("5919063:gift-box;1627207:ultra-black", "sku-gift-ultra"),
+            ],
+            {
+                "5919063:standard": "\u5b98\u65b9\u6807\u914d",
+                "5919063:gift-box": "520\u544a\u767d\u793c\u76d2",
+                "1627207:ultra-black": "Ultra\u5e7d\u96fe\u9ed1",
+            },
+            {"sku-standard-ultra": "488.41", "sku-gift-ultra": "520"},
+        )
+
+        price = self.collector.collect_prices_from_initial_sku_data(
+            FakeInitialDataPage(html),
+            "S7S Ultra 520\u544a\u767d\u793c\u76d2",
+        )
+
+        self.assertEqual(price, "520")
+
+    def test_specific_gift_box_model_does_not_fall_back_to_standard_ultra_when_gift_option_is_missing(self):
+        html = build_tmall_initial_sku_html(
+            [("5919063:standard;1627207:ultra-black", "sku-standard-ultra")],
+            {
+                "5919063:standard": "\u5b98\u65b9\u6807\u914d",
+                "1627207:ultra-black": "Ultra\u5e7d\u96fe\u9ed1",
+            },
+            {"sku-standard-ultra": "488.41"},
+        )
+
+        price = self.collector.collect_prices_from_initial_sku_data(
+            FakeInitialDataPage(html),
+            "S7S Ultra 520\u544a\u767d\u793c\u76d2",
+        )
+
+        self.assertIsNone(price)
+
+    def test_base_model_ignores_collection_and_gift_benefit_options_when_choosing_lowest_price(self):
+        html = build_tmall_initial_sku_html(
+            [
+                ("5919063:standard;1730001:collection-benefit", "sku-collection-benefit"),
+                ("5919063:standard;1730001:gift-benefit", "sku-gift-benefit"),
+                ("5919063:standard;1627207:ai2-white", "sku-ai2-white"),
+                ("5919063:standard;1627207:ai2-purple", "sku-ai2-purple"),
+                ("5919063:standard;1627207:ultra-black", "sku-ultra-black"),
+            ],
+            {
+                "5919063:standard": "\u5b98\u65b9\u6807\u914d",
+                "1730001:collection-benefit": "\u3010\u6536\u85cf\u52a0\u8d2d\u3011\u987a\u4e30\u6b21\u65e5\u8fbe|\u8054\u7cfb\u5ba2\u670d\u5907\u6ce8|0\u5143\u514d\u8d39\u8bd5\u7528",
+                "1730001:gift-benefit": "\u3010\u9650\u91cf\u793c\u8d60\u3011\u4e0b\u5355\u8d60\u9001\u4ef7\u503c270\u5143AI\u667a\u80fd\u4f53\u6743\u76ca",
+                "1627207:ai2-white": "AI2\u661f\u8f89\u767d",
+                "1627207:ai2-purple": "AI2\u66ae\u5149\u7d2b",
+                "1627207:ultra-black": "Ultra\u5e7d\u96fe\u9ed1",
+            },
+            {
+                "sku-collection-benefit": "391.76",
+                "sku-gift-benefit": "386.66",
+                "sku-ai2-white": "391.76",
+                "sku-ai2-purple": "391.76",
+                "sku-ultra-black": "488.41",
+            },
+        )
+
+        price = self.collector.collect_prices_from_initial_sku_data(
+            FakeInitialDataPage(html),
+            "S7S",
+        )
+
+        self.assertEqual(price, "391.76")
+
 
 class FakeSkuPage:
     def __init__(self, option_prices, base_text=""):
@@ -338,6 +651,45 @@ class FakeInitialDataPage(FakeSkuPage):
 
     def content(self):
         return self.html
+
+
+class FakeDelayedPromotionInitialDataPage(FakeInitialDataPage):
+    def __init__(self, html, body_texts):
+        super().__init__(html)
+        self.body_texts = list(body_texts)
+        self.body_read_count = 0
+        self.wait_timeouts = []
+
+    def locator(self, selector):
+        if selector != "body":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return FakeDelayedPromotionBodyLocator(self)
+
+    def wait_for_timeout(self, timeout):
+        self.wait_timeouts.append(timeout)
+
+
+class FakeDelayedSkuDataPage(FakeDelayedPromotionInitialDataPage):
+    def __init__(self, htmls, body_texts):
+        super().__init__(htmls[0], body_texts)
+        self.htmls = list(htmls)
+
+    def content(self):
+        index = min(max(self.body_read_count - 1, 0), len(self.htmls) - 1)
+        return self.htmls[index]
+
+
+class FakeDelayedPromotionBodyLocator:
+    def __init__(self, page):
+        self.page = page
+
+    def inner_text(self, timeout=5000):
+        index = min(self.page.body_read_count, len(self.page.body_texts) - 1)
+        self.page.body_read_count += 1
+        return self.page.body_texts[index]
+
+    def evaluate(self, script):
+        return list(self.page.option_prices)
 
 
 class FakePackageSkuPage:

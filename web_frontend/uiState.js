@@ -90,6 +90,7 @@
     if (systemStatus === "saving") return "主模板正在保存。";
     if (systemStatus === "sending") return "正在发送企业微信摘要和 Excel 文件。";
     if (systemStatus === "failed") return "任务失败，请查看最近日志中的失败原因。";
+    if (systemStatus === "partial_success") return "任务已完成，但有部分项目失败；可查看失败记录后补跑。";
     if (complete) return "周一到周五价格列已完整，可以发送当前模板。";
     if (missingDates.length) return `缺失日期：${missingDates.join("、")}，建议先补跑。`;
     return "系统待命，等待下一次自动任务。";
@@ -103,7 +104,7 @@
   function statusTone(status) {
     if (["active", "running", "backfilling", "saving", "sending"].includes(status)) return "active";
     if (["ok", "success", "complete", "done"].includes(status)) return "success";
-    if (["warning", "partial", "missing", "missing_sheet", "empty_template", "stopped"].includes(status)) return "warning";
+    if (["warning", "partial", "partial_success", "missing", "missing_sheet", "empty_template", "stopped"].includes(status)) return "warning";
     if (["danger", "failed", "error", "template_error"].includes(status)) return "danger";
     return "neutral";
   }
@@ -128,6 +129,7 @@
       saving: "保存中",
       sending: "推送中",
       success: "成功",
+      partial_success: "部分成功",
       failed: "失败",
       stopped: "已停止",
       complete: "完整",

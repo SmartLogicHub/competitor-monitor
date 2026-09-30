@@ -78,6 +78,18 @@ TAOBAO_PASSWORD_SELECTORS = (
 TAOBAO_SUBMIT_SELECTORS = ("button.fm-submit", "button[type='submit']", "#J_SubmitStatic", ".fm-button")
 TAOBAO_AGREEMENT_SELECTORS = ("#fm-agreement-checkbox", "input[name='fm-agreement-checkbox']")
 TAOBAO_LOGIN_OPTION_TEXTS = ("记住我的登录状态", "我已阅读并同意")
+DISCONNECT_ERROR_MARKERS = (
+    "connection closed while reading from the driver",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "browser context has been closed",
+    "playwright connection closed",
+    "driver connection closed",
+)
+
+
+class BrowserSessionUnavailableError(RuntimeError):
+    """Raised when a disconnected browser runtime cannot be recovered."""
 
 
 class PageAuthState(str, Enum):
@@ -214,6 +226,13 @@ class BrowserService:
         self._context = None
 
     def __enter__(self):
+        self._start_runtime()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop_runtime()
+
+    def _start_runtime(self) -> None:
         try:
             from rebrowser_playwright.sync_api import sync_playwright
         except ModuleNotFoundError as exc:
@@ -224,21 +243,94 @@ class BrowserService:
         self._playwright = sync_playwright().start()
         self._context = self._launch_persistent_context()
         self._restore_storage_state(self._context)
-        return self
 
-    def __exit__(self, exc_type, exc, tb):
-        if self._context:
-            self._context.close()
-        if self._playwright:
-            self._playwright.stop()
+    def _stop_runtime(self) -> None:
+        context = self._context
+        playwright = self._playwright
+        self._context = None
+        self._playwright = None
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if playwright:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+    @staticmethod
+    def is_disconnect_error(exc: BaseException) -> bool:
+        message = str(exc or "").casefold()
+        if any(marker in message for marker in DISCONNECT_ERROR_MARKERS):
+            return True
+        return "browsercontext.new_page" in message and ("closed" in message or "connection" in message)
+
+    def restart_after_disconnect(self) -> None:
+        self._stop_runtime()
+        min_delay = max(0.0, float(self.context_config.get("browser_restart_min_delay_seconds", 3)))
+        max_delay = max(0.0, float(self.context_config.get("browser_restart_max_delay_seconds", 8)))
+        random_delay(min_delay, max_delay)
+        self._taobao_auto_login_attempts = 0
+        try:
+            self._start_runtime()
+            if bool(self.context_config.get("taobao_login_check_enabled", True)):
+                self.ensure_taobao_login()
+        except Exception:
+            self._stop_runtime()
+            raise
 
     def open_page(self, url: str):
+        if self._context is None:
+            raise RuntimeError("Browser context has been closed")
         page = self._context.new_page()
         self._attach_manual_action_settings(page)
         page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         self.wait_after_operation()
         self._recover_page_auth(page)
         return page
+
+    def open_manual_page(self, url: str):
+        """Open a user-controlled page without triggering automatic login recovery."""
+        pages = list(getattr(self._context, "pages", []) or [])
+        page = pages[0] if pages else self._context.new_page()
+        self._attach_manual_action_settings(page)
+        page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        return page
+
+    def get_manual_page_auth_state(self, page) -> str:
+        """Inspect the current manual page without navigating or refreshing it."""
+        try:
+            if hasattr(page, "is_closed") and page.is_closed():
+                return "checking"
+        except Exception:
+            return "checking"
+        return detect_page_auth_state(page).value
+
+    def has_open_pages(self) -> bool:
+        try:
+            pages = list(getattr(self._context, "pages", []) or [])
+        except Exception:
+            return False
+        for page in pages:
+            try:
+                if hasattr(page, "is_closed") and page.is_closed():
+                    continue
+            except Exception:
+                continue
+            return True
+        return False
+
+    def persist_storage_state(self) -> bool:
+        if not self._context:
+            return False
+        try:
+            self.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._context.storage_state(path=str(self.storage_state_path))
+            return True
+        except Exception:
+            return False
 
     def ensure_taobao_login(self) -> PageAuthState:
         check_url = self.context_config.get("taobao_login_check_url", TAOBAO_LOGIN_CHECK_URL)

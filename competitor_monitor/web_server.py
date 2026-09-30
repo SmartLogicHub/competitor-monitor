@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import mimetypes
 import os
@@ -137,6 +138,10 @@ def _build_handler(service: WebApiService, web_root: Path):
                     filename, content = self._read_multipart_file()
                     self._send_json(service.upload_template(filename, content))
                     return
+                if parsed.path == "/api/session/import-cookies":
+                    filename, content = self._read_multipart_file()
+                    self._send_json(service.import_taobao_cookies(filename, content))
+                    return
                 payload = self._read_json()
                 if parsed.path == "/api/tasks/run":
                     self._send_json(service.run_task(payload))
@@ -154,6 +159,11 @@ def _build_handler(service: WebApiService, web_root: Path):
                     self._send_json(service.cleanup_maintenance(str(payload.get("scope") or "")))
                 elif parsed.path == "/api/session/reset":
                     self._send_json(service.reset_session(str(payload.get("target") or "")))
+                elif parsed.path == "/api/session/open":
+                    if str(payload.get("target") or "taobao") != "taobao":
+                        self._send_json({"message": "仅支持打开淘宝登录网页", "error": "unsupported_target"})
+                    else:
+                        self._send_json(service.open_taobao_login())
                 else:
                     self._send_json({"message": "接口不存在"}, status=404)
             except Exception as exc:
@@ -180,6 +190,8 @@ def _build_handler(service: WebApiService, web_root: Path):
                 self._send_file(service.get_template_file())
             elif path == "/api/config":
                 self._send_json(service.get_config())
+            elif path == "/api/session/status":
+                self._send_json(service.get_login_session_status())
             elif path == "/api/logs":
                 self._send_json(service.get_logs(_query_one(query, "level", "all"), _query_one(query, "q", "")))
             elif path == "/api/results":
@@ -315,9 +327,30 @@ def _multipart_filename(headers: str) -> str:
     return "template.xlsx"
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--manual-taobao-login", action="store_true")
+    parser.add_argument("--runtime-dir", default=None)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--login-url", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+    if args.manual_taobao_login:
+        from manual_login import run_taobao_login_browser
+
+        base_dir = Path(args.runtime_dir).resolve() if args.runtime_dir else runtime_base_dir()
+        config_path = Path(args.config) if args.config else ensure_local_config(base_dir)
+        return run_taobao_login_browser(
+            base_dir=base_dir,
+            config_path=config_path,
+            login_url=args.login_url,
+        )
+    run_server()
+    return 0
+
+
 if __name__ == "__main__":
     try:
-        run_server()
+        raise SystemExit(main())
     except Exception as exc:
         _write_startup_error(exc)
         raise

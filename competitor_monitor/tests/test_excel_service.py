@@ -26,7 +26,13 @@ def create_sample_workbook(path: Path) -> None:
     ws["I2"] = "活动"
     ws["J2"] = "上架日期"
     ws["K2"] = "型号"
+    ws["L2"] = "形态"
+    ws["M2"] = "价格"
+    ws["N2"] = "直播价格"
+    ws["S2"] = "新卖点"
     for cell, value in zip(["C3", "D3", "E3", "F3", "G3"], ["6月29", "6月30", "7月1", "7月2", "7月3"]):
+        ws[cell] = value
+    for cell, value in zip(["N3", "O3", "P3", "Q3", "R3"], ["6月29", "6月30", "7月1", "7月2", "7月3"]):
         ws[cell] = value
     ws["H3"] = "价格情况"
     ws["A4"] = "塞那"
@@ -34,7 +40,13 @@ def create_sample_workbook(path: Path) -> None:
     ws["B4"].hyperlink = "https://detail.tmall.com/item.htm?id=800417757444"
     ws["C4"] = "268.52"
     ws["I4"] = "国补"
-    ws["J4"] = "无上新"
+    ws["J4"] = "6月30"
+    ws["K4"] = "旧上新型号"
+    ws["L4"] = "耳夹式"
+    ws["M4"] = 399
+    for cell in ["N4", "O4", "P4", "Q4", "R4"]:
+        ws[cell] = 299
+    ws["S4"] = "旧卖点"
     ws["A5"] = None
     ws["B5"] = "S6S ultra"
     ws["B5"].hyperlink = "https://detail.tmall.com/item.htm?id=922811879396"
@@ -75,12 +87,14 @@ class ExcelServiceTest(unittest.TestCase):
 
             self.assertEqual(ws.title, "7.6-7.10")
             self.assertEqual([ws[cell].value for cell in ["C3", "D3", "E3", "F3", "G3"]], ["7月6", "7月7", "7月8", "7月9", "7月10"])
+            self.assertEqual([ws[cell].value for cell in ["N3", "O3", "P3", "Q3", "R3"]], ["7月6", "7月7", "7月8", "7月9", "7月10"])
             self.assertEqual(ws["B4"].value, "S6S proII")
             self.assertIn("id=800417757444", ws["B4"].hyperlink.target)
             self.assertIsNone(ws["C4"].value)
             self.assertIsNone(ws["I4"].value)
-            self.assertIsNone(ws["J4"].value)
-            self.assertIsNone(ws["K5"].value)
+            for row in range(4, 6):
+                for column in range(10, 20):
+                    self.assertIsNone(ws.cell(row=row, column=column).value)
 
     def test_refuses_to_create_sheet_for_weekend_date(self):
         with tempfile.TemporaryDirectory() as tmpdir:

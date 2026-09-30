@@ -60,6 +60,8 @@ test("status helpers expose the shared feedback language", () => {
   assert.equal(statusTone("running"), "active");
   assert.equal(statusTone("template_error"), "danger");
   assert.equal(statusText("sending"), "推送中");
+  assert.equal(statusTone("partial_success"), "warning");
+  assert.equal(statusText("partial_success"), "部分成功");
 });
 
 test("live status helper treats every backend active state as running", () => {

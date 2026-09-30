@@ -10,7 +10,7 @@ from unittest.mock import patch
 from openpyxl import Workbook
 
 from web_api import WebApiService
-from web_server import _safe_print, _write_startup_error, create_server, run_server
+from web_server import _safe_print, _write_startup_error, create_server, main, run_server
 
 
 def create_template(path: Path, model: str = "S6S proII") -> None:
@@ -32,6 +32,7 @@ def create_template(path: Path, model: str = "S6S proII") -> None:
     ws["K2"] = "型号"
     ws["L2"] = "形态"
     ws["M2"] = "价格"
+    ws["N2"] = "直播价格"
     ws["S2"] = "新卖点"
     ws["A4"] = "塞那"
     ws["B4"] = model
@@ -55,6 +56,30 @@ def multipart_body(field_name: str, filename: str, content: bytes) -> tuple[byte
 
 
 class WebServerTest(unittest.TestCase):
+    def test_internal_manual_login_mode_uses_requested_runtime_and_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            config_path = base_dir / "competitor_monitor" / "config.yaml"
+            with patch("manual_login.run_taobao_login_browser", return_value=0) as run_login:
+                result = main(
+                    [
+                        "--manual-taobao-login",
+                        "--runtime-dir",
+                        str(base_dir),
+                        "--config",
+                        str(config_path),
+                        "--login-url",
+                        "https://detail.tmall.com/item.htm?id=123",
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        run_login.assert_called_once_with(
+            base_dir=base_dir.resolve(),
+            config_path=config_path,
+            login_url="https://detail.tmall.com/item.htm?id=123",
+        )
+
     def test_runtime_base_dir_can_be_overridden_for_packaged_runtime_data(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict("os.environ", {"COMPETITOR_MONITOR_RUNTIME_DIR": tmpdir}):
@@ -163,6 +188,64 @@ class WebServerTest(unittest.TestCase):
                 response = json.loads(urlopen(request, timeout=2).read().decode("utf-8"))
 
                 self.assertEqual(response["message"], "任务已启动")
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_routes_taobao_login_open_and_status(self):
+        class FakeProcess:
+            pid = 2468
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(
+                base_dir=Path(tmpdir),
+                manual_login_launcher=lambda *args, **kwargs: FakeProcess(),
+            )
+            server = create_server("127.0.0.1", 0, service, Path(tmpdir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                root = f"http://127.0.0.1:{server.server_address[1]}"
+                request = Request(
+                    f"{root}/api/session/open",
+                    data=json.dumps({"target": "taobao"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                opened = json.loads(urlopen(request, timeout=2).read().decode("utf-8"))
+                status = json.loads(urlopen(f"{root}/api/session/status", timeout=2).read().decode("utf-8"))
+
+                self.assertEqual(opened["status"], "running")
+                self.assertEqual(status["status"], "running")
+                self.assertEqual(status["target"], "taobao")
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_routes_taobao_cookie_json_upload_to_local_service(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            service = WebApiService(base_dir=base_dir)
+            server = create_server("127.0.0.1", 0, service, Path(tmpdir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                root = f"http://127.0.0.1:{server.server_address[1]}"
+                content = b'[{"name":"token","value":"secret","domain":".tmall.com","path":"/"}]'
+                body, content_type = multipart_body("cookies", "cookies.json", content)
+                request = Request(
+                    f"{root}/api/session/import-cookies",
+                    data=body,
+                    headers={"Content-Type": content_type},
+                    method="POST",
+                )
+                response = json.loads(urlopen(request, timeout=2).read().decode("utf-8"))
+
+                self.assertEqual(response["cookie_count"], 1)
+                self.assertNotIn("secret", json.dumps(response, ensure_ascii=False))
             finally:
                 server.shutdown()
                 server.server_close()

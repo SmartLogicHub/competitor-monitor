@@ -63,7 +63,16 @@ def main() -> int:
     )
     if status.get("last_notify_error"):
         print(f"WeCom notify error: {status.get('last_notify_error')}")
-    return 0 if status.get("system_status") == "success" else 1
+    return task_exit_code(status.get("system_status"))
+
+
+def task_exit_code(status: str | None) -> int:
+    return {
+        "success": 0,
+        "failed": 1,
+        "partial_success": 2,
+        "stopped": 3,
+    }.get(str(status or ""), 1)
 
 
 def runtime_base_dir() -> Path:

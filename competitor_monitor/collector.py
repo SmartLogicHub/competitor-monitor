@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -14,6 +15,13 @@ class ProductSnapshot:
     price: str | None
     activities: list[str]
     visible_text: str
+    visible_promotion_price: str | None = None
+    sku_candidate_price: str | None = None
+    promotion_content_ready: bool = False
+    promotion_body_reads: int = 1
+    model_variant_missing: bool = False
+    explicitly_unavailable: bool = False
+    target_model_replaced: bool = False
 
 
 @dataclass(frozen=True)
@@ -24,6 +32,9 @@ class SkuPriceOption:
 
 class ProductCollector:
     DEFAULT_BLOCKED_UNMATCHED_SKU_FALLBACK_MODELS = {"a5"}
+    CONTROLLED_MODEL_ALIASES = {
+        "动钛圈": ("opendotsone",),
+    }
 
     PRICE_RULES = [
         "平台加补后",
@@ -39,8 +50,16 @@ class ProductCollector:
         self,
         activity_service: ActivityService,
         blocked_unmatched_sku_fallback_models: list[str] | None = None,
+        promotion_content_wait_seconds: float = 10,
+        promotion_content_poll_milliseconds: int = 500,
+        promotion_price_stable_reads: int = 2,
+        sku_price_settle_reads: int = 8,
     ):
         self.activity_service = activity_service
+        self.promotion_content_wait_seconds = max(0.0, float(promotion_content_wait_seconds))
+        self.promotion_content_poll_milliseconds = max(1, int(promotion_content_poll_milliseconds))
+        self.promotion_price_stable_reads = max(2, int(promotion_price_stable_reads))
+        self.sku_price_settle_reads = max(2, int(sku_price_settle_reads))
         models = (
             blocked_unmatched_sku_fallback_models
             if blocked_unmatched_sku_fallback_models is not None
@@ -58,22 +77,123 @@ class ProductCollector:
         expected_model: str | None = None,
         allow_fallback_price: bool = True,
     ) -> ProductSnapshot:
-        visible_text = page.locator("body").inner_text(timeout=5000)
+        visible_text, promotion_content_ready, promotion_body_reads = self.wait_for_promotion_content(
+            page,
+            expected_model=expected_model,
+        )
+        visible_promotion_price = self.extract_priority_price(visible_text)
         price = self.extract_price(visible_text)
-        if expected_model:
-            price = self.collect_matched_sku_prices(
-                page,
-                expected_model,
-                fallback_price=price,
-                allow_fallback_price=allow_fallback_price,
-                fallback_visible_text=visible_text,
-            )
-            visible_text = page.locator("body").inner_text(timeout=5000)
+        sku_candidate_price = None
+        model_variant_missing = False
+        explicitly_unavailable = self.page_is_explicitly_unavailable(visible_text)
+        target_model_replaced = bool(
+            expected_model and self.page_confirms_different_product(expected_model, visible_text)
+        )
+        if explicitly_unavailable or target_model_replaced:
+            price = None
+        elif expected_model:
+            model_variant_missing = self.specific_model_variant_is_missing(page, expected_model)
+            if not model_variant_missing:
+                sku_candidate_price = self.collect_matched_sku_prices(
+                    page,
+                    expected_model,
+                    fallback_price=price,
+                    allow_fallback_price=allow_fallback_price,
+                    fallback_visible_text=visible_text,
+                )
+            if (
+                visible_promotion_price
+                and sku_candidate_price
+                and not self.priority_price_is_starting_price(visible_text)
+            ):
+                price = visible_promotion_price
+            else:
+                price = sku_candidate_price
         return ProductSnapshot(
             price=price,
             activities=self.activity_service.recognize(visible_text),
             visible_text=visible_text,
+            visible_promotion_price=visible_promotion_price,
+            sku_candidate_price=sku_candidate_price,
+            promotion_content_ready=promotion_content_ready,
+            promotion_body_reads=promotion_body_reads,
+            model_variant_missing=model_variant_missing,
+            explicitly_unavailable=explicitly_unavailable,
+            target_model_replaced=target_model_replaced,
         )
+
+    @staticmethod
+    def page_is_explicitly_unavailable(visible_text: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(visible_text or ""))
+        markers = (
+            "商品已下架",
+            "此商品已下架",
+            "商品已经下架",
+            "此商品已经下架",
+            "宝贝已下架",
+            "此宝贝已下架",
+            "宝贝已经下架",
+            "此宝贝已经下架",
+            "商品不存在",
+            "宝贝不存在",
+            "商品已失效",
+            "宝贝已失效",
+            "商品已过期",
+            "宝贝已过期",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def wait_for_promotion_content(self, page, expected_model: str | None = None) -> tuple[str, bool, int]:
+        max_waits = int(
+            math.ceil(
+                (self.promotion_content_wait_seconds * 1000) / self.promotion_content_poll_milliseconds
+            )
+        )
+        visible_text = page.locator("body").inner_text(timeout=5000)
+        previous_price_candidate = self.ready_price_candidate(page, visible_text, expected_model)
+        stable_price_reads = 1 if previous_price_candidate else 0
+        for attempt in range(max_waits):
+            self.wait_for_promotion_poll(page)
+            visible_text = page.locator("body").inner_text(timeout=5000)
+            price_candidate = self.ready_price_candidate(page, visible_text, expected_model)
+            if price_candidate and price_candidate == previous_price_candidate:
+                stable_price_reads += 1
+            elif price_candidate:
+                previous_price_candidate = price_candidate
+                stable_price_reads = 1
+            else:
+                previous_price_candidate = None
+                stable_price_reads = 0
+            required_stable_reads = self.required_stable_reads_for_candidate(price_candidate)
+            if stable_price_reads >= required_stable_reads:
+                return visible_text, True, attempt + 2
+        return visible_text, False, max_waits + 1
+
+    def ready_price_candidate(
+        self,
+        page,
+        visible_text: str,
+        expected_model: str | None,
+    ) -> tuple[str, str] | None:
+        promotion_price = self.extract_priority_price(visible_text)
+        if promotion_price:
+            return ("visible_promotion", promotion_price)
+        if expected_model:
+            initial_sku_price = self.collect_prices_from_initial_sku_data(page, expected_model)
+            if initial_sku_price:
+                return ("initial_sku", initial_sku_price)
+        return None
+
+    def required_stable_reads_for_candidate(self, candidate: tuple[str, str] | None) -> int:
+        if candidate and candidate[0] == "initial_sku":
+            return self.sku_price_settle_reads
+        return self.promotion_price_stable_reads
+
+    def wait_for_promotion_poll(self, page) -> None:
+        try:
+            page.wait_for_timeout(self.promotion_content_poll_milliseconds)
+        except AttributeError:
+            return
 
     def collect_matched_sku_prices(
         self,
@@ -100,6 +220,12 @@ class ProductCollector:
             if self.page_misses_required_model_tokens(expected_model, fallback_visible_text or ""):
                 return None
             if self.should_block_unmatched_sku_fallback(expected_model, option_texts):
+                if self.can_use_title_confirmed_non_starting_page_price(
+                    expected_model,
+                    fallback_price,
+                    fallback_visible_text or "",
+                ):
+                    return fallback_price
                 return None
             return fallback_price
         self.select_standard_package_option(page, raw_option_texts)
@@ -148,11 +274,33 @@ class ProductCollector:
         if not tokens:
             return False
         normalized_page = normalize_sku_text(visible_text)
+        normalized_model = normalize_sku_text(expected_model)
+        aliases = ProductCollector.CONTROLLED_MODEL_ALIASES.get(normalized_model, ())
+        if any(alias in normalized_page for alias in aliases):
+            return False
         if any(token in normalized_page for token in tokens):
             return False
         if exact_tokens:
             return True
         return not ProductCollector._page_contains_distinctive_chinese_model_part(expected_model, normalized_page)
+
+    @staticmethod
+    def page_confirms_different_product(expected_model: str, visible_text: str) -> bool:
+        text = str(visible_text or "")
+        if not text or not ProductCollector.page_misses_required_model_tokens(expected_model, text):
+            return False
+        if "参数信息" not in text or not any(marker in text for marker in ("图文详情", "用户评价")):
+            return False
+        if re.search(r"请登录|登录后|安全验证|滑动验证|访问被拒绝|网络异常", text):
+            return False
+        model_match = re.search(
+            r"(?:^|\n)\s*型号\s*(?:[:：]\s*)?(?:\n|\s+)\s*([^\n￥¥]{1,60})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not model_match or not normalize_sku_text(model_match.group(1)):
+            return False
+        return bool(re.search(r"[￥¥]\s*(?:\n\s*)?\d+(?:\.\d+)?", text))
 
     @staticmethod
     def _page_contains_distinctive_chinese_model_part(expected_model: str, normalized_page: str) -> bool:
@@ -189,6 +337,34 @@ class ProductCollector:
             and self.has_risky_variant_options(option_texts)
         )
 
+    def can_use_title_confirmed_non_starting_page_price(
+        self,
+        expected_model: str,
+        fallback_price: str | None,
+        visible_text: str,
+    ) -> bool:
+        if not fallback_price or self.page_misses_required_model_tokens(expected_model, visible_text):
+            return False
+        priority_price = self.extract_priority_price(visible_text)
+        if priority_price != fallback_price:
+            return False
+        return not self.priority_price_is_starting_price(visible_text)
+
+    @classmethod
+    def priority_price_is_starting_price(cls, visible_text: str) -> bool:
+        text = re.sub(r"\s+", " ", visible_text or "")
+        for keyword in cls.PRICE_RULES:
+            position = text.find(keyword)
+            if position < 0:
+                continue
+            after_keyword = text[position + len(keyword) : position + len(keyword) + 64]
+            price_match = re.search(r"(?:[\u00a5\uffe5]\s*)?\d+(?:\.\d+)?", after_keyword)
+            if not price_match:
+                continue
+            price_tail = after_keyword[price_match.end() : price_match.end() + 4]
+            return bool(re.match(r"\s*\u8d77", price_tail))
+        return False
+
     @staticmethod
     def filter_sku_option_texts(expected_model: str, option_texts: list[str]) -> list[str]:
         filtered: list[str] = []
@@ -196,6 +372,8 @@ class ProductCollector:
         for option_text in option_texts:
             text = str(option_text or "").strip()
             if not text or text in seen:
+                continue
+            if ProductCollector.is_non_product_sku_option(text):
                 continue
             if ProductCollector.is_product_title_like_candidate(expected_model, text):
                 continue
@@ -254,11 +432,14 @@ class ProductCollector:
             html = page.content()
         except Exception:
             return None
-        options = self.extract_initial_sku_price_options(html)
+        options = self.extract_initial_sku_price_options(html, expected_model=expected_model)
+        options = [option for option in options if not self.is_non_product_sku_option(option.text)]
         if not options:
             return None
 
         matched_texts = match_sku_options(expected_model, [option.text for option in options])
+        if not matched_texts:
+            matched_texts = self.match_variant_sku_options(expected_model, options)
         if not matched_texts:
             return None
         matched_set = set(matched_texts)
@@ -271,7 +452,64 @@ class ProductCollector:
             return None
         return self._lowest_price_text([price for _, price in prices])
 
-    def extract_initial_sku_price_options(self, html: str) -> list[SkuPriceOption]:
+    @staticmethod
+    def match_variant_sku_options(expected_model: str, options: list[SkuPriceOption]) -> list[str]:
+        normalized_model = normalize_sku_text(expected_model)
+        upgrade_markers = ("pro", "ultra")
+        requested_upgrade = next((marker for marker in upgrade_markers if marker in normalized_model), None)
+        if requested_upgrade:
+            return [option.text for option in options if requested_upgrade in normalize_sku_text(option.text)]
+        return [
+            option.text
+            for option in options
+            if not any(marker in normalize_sku_text(option.text) for marker in upgrade_markers)
+        ]
+
+    @staticmethod
+    def is_non_product_sku_option(option_text: str) -> bool:
+        normalized = normalize_sku_text(option_text)
+        markers = (
+            "收藏加购",
+            "加购",
+            "限量礼赠",
+            "礼赠",
+            "下单赠送",
+            "赠送",
+            "赠品",
+            "免费试用",
+            "试用",
+            "权益",
+            "联系客服",
+            "客服备注",
+            "顺丰",
+            "次日达",
+        )
+        return any(normalize_sku_text(marker) in normalized for marker in markers)
+
+    @staticmethod
+    def specific_model_variant_is_missing(page, expected_model: str) -> bool:
+        required_tokens = ProductCollector.specific_model_variant_tokens(expected_model)
+        if not required_tokens:
+            return False
+        option_texts = ProductCollector.extract_sku_option_texts(page)
+        try:
+            initial_data = ProductCollector._extract_initial_app_data(page.content())
+        except Exception:
+            initial_data = None
+        sku_resource = ProductCollector._find_sku_resource(initial_data) if initial_data else None
+        for prop in (sku_resource or {}).get("skuBase", {}).get("props", []) or []:
+            for value in prop.get("values") or []:
+                option_texts.append(str(value.get("name") or ""))
+        if not any(str(option_text or "").strip() for option_text in option_texts):
+            return False
+        normalized_options = normalize_sku_text(" ".join(option_texts))
+        return not all(token in normalized_options for token in required_tokens)
+
+    def extract_initial_sku_price_options(
+        self,
+        html: str,
+        expected_model: str | None = None,
+    ) -> list[SkuPriceOption]:
         data = self._extract_initial_app_data(html)
         if not data:
             return []
@@ -282,7 +520,12 @@ class ProductCollector:
         sku_base = sku_resource.get("skuBase") or {}
         sku_core = sku_resource.get("skuCore") or {}
         sku2info = sku_core.get("sku2info") or {}
-        value_names, standard_package_values = self._build_sku_value_maps(sku_base)
+        value_names, selected_package_values, required_package_missing = self._build_sku_value_maps(
+            sku_base,
+            expected_model=expected_model,
+        )
+        if required_package_missing:
+            return []
         options: list[SkuPriceOption] = []
         seen: set[tuple[str, str]] = set()
         for sku in sku_base.get("skus") or []:
@@ -291,9 +534,9 @@ class ProductCollector:
             if not sku_id or not prop_path:
                 continue
             prop_values = [part for part in prop_path.split(";") if part]
-            if standard_package_values and not any(part in standard_package_values for part in prop_values):
+            if selected_package_values and not any(part in selected_package_values for part in prop_values):
                 continue
-            product_values = [part for part in prop_values if part not in standard_package_values]
+            product_values = [part for part in prop_values if part not in selected_package_values]
             product_labels = [value_names.get(part, part) for part in product_values]
             all_labels = [value_names.get(part, part) for part in prop_values]
             text = " / ".join(product_labels or all_labels)
@@ -366,10 +609,15 @@ class ProductCollector:
                     return found
         return None
 
-    @staticmethod
-    def _build_sku_value_maps(sku_base: dict) -> tuple[dict[str, str], set[str]]:
+    @classmethod
+    def _build_sku_value_maps(
+        cls,
+        sku_base: dict,
+        expected_model: str | None = None,
+    ) -> tuple[dict[str, str], set[str], bool]:
         value_names: dict[str, str] = {}
         standard_package_values: set[str] = set()
+        package_values: list[tuple[str, str]] = []
         for prop in sku_base.get("props") or []:
             pid = str(prop.get("pid") or "")
             is_package_prop = str(prop.get("packProp") or "").lower() == "true" or "套餐" in str(prop.get("name") or "")
@@ -384,11 +632,64 @@ class ProductCollector:
                 value_names[key] = name
                 if is_package_prop:
                     package_value_keys.append(key)
+                    package_values.append((key, name))
                     if "官方标配" in name:
                         standard_package_values.add(key)
             if is_package_prop and not standard_package_values and package_value_keys:
                 standard_package_values.add(package_value_keys[0])
-        return value_names, standard_package_values
+        gift_package_values = cls._matching_gift_package_values(expected_model, package_values)
+        required_package_missing = cls.requires_specific_package(expected_model) and not gift_package_values
+        return value_names, gift_package_values or standard_package_values, required_package_missing
+
+    @staticmethod
+    def _matching_gift_package_values(
+        expected_model: str | None,
+        package_values: list[tuple[str, str]],
+    ) -> set[str]:
+        normalized_model = normalize_sku_text(expected_model or "")
+        gift_markers = ("礼盒", "礼包", "套装", "套餐")
+        if not ProductCollector.requires_specific_package(expected_model):
+            return set()
+        gift_candidates = [
+            (key, normalize_sku_text(name))
+            for key, name in package_values
+            if any(normalize_sku_text(marker) in normalize_sku_text(name) for marker in gift_markers)
+        ]
+        if not gift_candidates:
+            return set()
+        model_numbers = re.findall(r"\d{2,}", normalized_model)
+        if model_numbers:
+            numbered = [
+                key
+                for key, name in gift_candidates
+                if all(number in name for number in model_numbers)
+            ]
+            if numbered:
+                return set(numbered)
+        if len(gift_candidates) == 1:
+            return {gift_candidates[0][0]}
+        return set()
+
+    @staticmethod
+    def requires_specific_package(expected_model: str | None) -> bool:
+        normalized_model = normalize_sku_text(expected_model or "")
+        return any(
+            normalize_sku_text(marker) in normalized_model
+            for marker in ("礼盒", "礼包", "套装", "套餐")
+        )
+
+    @staticmethod
+    def specific_model_variant_tokens(expected_model: str) -> list[str]:
+        if not ProductCollector.requires_specific_package(expected_model):
+            return []
+        normalized_model = normalize_sku_text(expected_model)
+        tokens = list(re.findall(r"\d{2,}", normalized_model))
+        tokens.extend(
+            normalize_sku_text(marker)
+            for marker in ("礼盒", "礼包", "套装", "套餐")
+            if normalize_sku_text(marker) in normalized_model
+        )
+        return list(dict.fromkeys(tokens))
 
     @staticmethod
     def _extract_sku_price_text(sku_info: dict) -> str | None:

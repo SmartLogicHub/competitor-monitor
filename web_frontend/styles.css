@@ -1919,6 +1919,24 @@ button {
   line-height: 1.5;
 }
 
+.account-session-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.session-state-text,
+.account-login-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.account-login-hint {
+  margin: -6px 0 0;
+}
+
 .account-card-header {
   display: flex;
   align-items: flex-start;

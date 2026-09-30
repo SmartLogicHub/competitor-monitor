@@ -35,6 +35,7 @@ def create_uploadable_template(path: Path, model: str = "S6S proII") -> None:
     ws["K2"] = "型号"
     ws["L2"] = "形态"
     ws["M2"] = "价格"
+    ws["N2"] = "直播价格"
     ws["S2"] = "新卖点"
     ws["A4"] = "塞那"
     ws["B4"] = model
@@ -43,6 +44,265 @@ def create_uploadable_template(path: Path, model: str = "S6S proII") -> None:
 
 
 class WebApiServiceTest(unittest.TestCase):
+    def test_completed_task_with_failed_results_is_partial_success(self):
+        def runner(context: RunContext) -> None:
+            context.record_result({"mode": "daily_price", "model": "P1", "status": "success"})
+            context.record_result({"mode": "daily_price", "model": "P2", "status": "failed", "error": "timeout"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(base_dir=Path(tmpdir), runner=runner)
+            service.run_task({"mode": "daily_price", "run_date": "2026-07-07"})
+            service.wait_for_current_task(timeout=1)
+
+            status = service.get_tasks_status()
+
+        self.assertEqual(status["system_status"], "partial_success")
+        self.assertEqual(status["failed_count"], 1)
+
+    def test_backfill_continues_after_one_date_fails(self):
+        attempted = []
+
+        def runner(context: RunContext) -> None:
+            run_date = context.payload["run_date"]
+            attempted.append(run_date)
+            if run_date == "2026-07-01":
+                raise RuntimeError("first date failed")
+            context.record_result({"mode": "daily_price", "model": run_date, "status": "success"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(base_dir=Path(tmpdir), runner=runner)
+            service.backfill_template({"dates": ["2026-07-01", "2026-07-02"]})
+            service.wait_for_current_task(timeout=1)
+
+            status = service.get_tasks_status()
+
+        self.assertEqual(attempted, ["2026-07-01", "2026-07-02"])
+        self.assertEqual(status["system_status"], "partial_success")
+        self.assertEqual(status["failed_count"], 1)
+
+    def test_import_taobao_cookies_writes_configured_storage_without_echoing_secrets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            config_path = base_dir / "competitor_monitor" / "config.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                'browser_storage_state_path: "competitor_monitor/browser_profile/storage_state.json"\n',
+                encoding="utf-8",
+            )
+            service = WebApiService(base_dir=base_dir, config_path=config_path)
+            self.assertTrue(
+                hasattr(service, "import_taobao_cookies"),
+                "WebApiService.import_taobao_cookies is missing",
+            )
+            content = b'[{"name":"token","value":"top-secret","domain":".taobao.com","path":"/"}]'
+
+            response = service.import_taobao_cookies("cookies.json", content)
+            storage_path = base_dir / "competitor_monitor" / "browser_profile" / "storage_state.json"
+            saved = json.loads(storage_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(response["cookie_count"], 1)
+        self.assertNotIn("top-secret", json.dumps(response, ensure_ascii=False))
+        self.assertEqual(saved["cookies"][0]["value"], "top-secret")
+
+    def test_import_taobao_cookies_is_blocked_while_collection_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(base_dir=Path(tmpdir), runner=lambda context: None)
+            service.status["system_status"] = "running"
+            self.assertTrue(hasattr(service, "import_taobao_cookies"))
+
+            response = service.import_taobao_cookies(
+                "cookies.json",
+                b'[{"name":"token","value":"secret","domain":".taobao.com"}]',
+            )
+
+        self.assertEqual(response["error"], "task_running")
+
+    def test_manual_login_command_uses_first_monitored_tmall_product_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            workbook_path = base_dir / "current.xlsx"
+            create_uploadable_template(workbook_path)
+            config_path = base_dir / "config.yaml"
+            config_path.write_text('excel_path: "current.xlsx"\n', encoding="utf-8")
+            service = WebApiService(
+                base_dir=base_dir,
+                config_path=config_path,
+                today_provider=lambda: date(2026, 7, 8),
+            )
+
+            command = service._manual_login_command()
+
+        self.assertIn("--login-url", command)
+        login_url_index = command.index("--login-url") + 1
+        self.assertEqual(command[login_url_index], "https://detail.tmall.com/item.htm?id=1")
+
+    def test_taobao_login_browser_is_mutually_exclusive_with_collection(self):
+        launches = []
+
+        class FakeProcess:
+            pid = 4321
+
+            def poll(self):
+                return None
+
+        def launcher(command, **kwargs):
+            launches.append((command, kwargs))
+            return FakeProcess()
+
+        runner_calls = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(
+                base_dir=Path(tmpdir),
+                runner=lambda context: runner_calls.append(context),
+                manual_login_launcher=launcher,
+            )
+
+            opened = service.open_taobao_login()
+            duplicate = service.open_taobao_login()
+            blocked_run = service.run_task({"mode": "daily_price"})
+            session = service.get_login_session_status()
+
+        self.assertEqual(opened["status"], "running")
+        self.assertEqual(duplicate["error"], "manual_login_running")
+        self.assertEqual(blocked_run["error"], "manual_login_running")
+        self.assertEqual(session["status"], "running")
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(runner_calls, [])
+        self.assertIn("--manual-taobao-login", launches[0][0])
+
+    def test_running_login_browser_reports_persisted_auth_status(self):
+        class FakeProcess:
+            pid = 4321
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(
+                base_dir=Path(tmpdir),
+                manual_login_launcher=lambda *args, **kwargs: FakeProcess(),
+            )
+            service.open_taobao_login()
+            service.manual_login_state_path.write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "auth_status": "authenticated",
+                        "pid": 4321,
+                        "error": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            session = service.get_login_session_status()
+
+        self.assertEqual(session["status"], "running")
+        self.assertEqual(session["auth_status"], "authenticated")
+
+    def test_taobao_login_browser_is_rejected_while_collection_runs(self):
+        started = threading.Event()
+        release = threading.Event()
+        launches = []
+
+        def runner(_context):
+            started.set()
+            release.wait(1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(
+                base_dir=Path(tmpdir),
+                runner=runner,
+                manual_login_launcher=lambda *args, **kwargs: launches.append((args, kwargs)),
+            )
+            service.run_task({"mode": "daily_price", "run_date": "2026-07-20"})
+            self.assertTrue(started.wait(1))
+
+            response = service.open_taobao_login()
+            release.set()
+            service.wait_for_current_task(timeout=1)
+
+        self.assertEqual(response["error"], "task_running")
+        self.assertEqual(launches, [])
+
+    def test_taobao_login_process_exit_and_launch_failure_are_reported(self):
+        class FakeProcess:
+            pid = 9876
+            return_code = None
+
+            def poll(self):
+                return self.return_code
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            process = FakeProcess()
+            service = WebApiService(
+                base_dir=Path(tmpdir),
+                manual_login_launcher=lambda *args, **kwargs: process,
+            )
+            service.open_taobao_login()
+            process.return_code = 0
+            closed = service.get_login_session_status()
+
+            failed_service = WebApiService(
+                base_dir=Path(tmpdir) / "failed",
+                manual_login_launcher=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("chrome missing")),
+            )
+            failed = failed_service.open_taobao_login()
+            failed_status = failed_service.get_login_session_status()
+
+        self.assertEqual(closed["status"], "closed")
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("chrome missing", failed["error"])
+        self.assertEqual(failed_status["status"], "failed")
+
+    def test_login_session_state_blocks_a_separate_scheduled_service(self):
+        class FakeProcess:
+            pid = 6789
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            web_service = WebApiService(
+                base_dir=base_dir,
+                manual_login_launcher=lambda *args, **kwargs: FakeProcess(),
+            )
+            web_service.open_taobao_login()
+            scheduled_service = WebApiService(base_dir=base_dir, runner=lambda context: None)
+
+            blocked = scheduled_service.run_task({"mode": "daily_price"})
+            blocked_backfill = scheduled_service.backfill_template({"dates": ["2026-07-20"]})
+            scheduled_service.wait_for_current_task(timeout=1)
+            reset = scheduled_service.reset_session("taobao")
+
+        self.assertEqual(blocked["error"], "manual_login_running")
+        self.assertEqual(blocked_backfill["error"], "manual_login_running")
+        self.assertEqual(reset["error"], "manual_login_running")
+
+    def test_manual_run_without_date_uses_current_local_date_not_stale_config(self):
+        observed = []
+
+        def runner(context: RunContext) -> None:
+            observed.append(context.service.status["run_date"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            config_path = base_dir / "config.yaml"
+            config_path.write_text('run_date: "2026-07-19"\n', encoding="utf-8")
+            service = WebApiService(
+                base_dir=base_dir,
+                config_path=config_path,
+                runner=runner,
+                today_provider=lambda: date(2026, 7, 21),
+            )
+
+            service.run_task({"mode": "daily_price"})
+            service.wait_for_current_task(timeout=1)
+
+            self.assertEqual(observed, ["2026-07-21"])
+            self.assertEqual(service.get_tasks_status()["run_date"], "2026-07-21")
+
     def test_idle_status_previews_target_sheet_from_today_not_stale_config_date(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
@@ -101,6 +361,20 @@ class WebApiServiceTest(unittest.TestCase):
             self.assertEqual(public_config["weekly_new_time"], "11:12")
             self.assertEqual(public_config["price_trend_time"], "18:45")
             self.assertIn("系统计划任务已同步", [item["message"] for item in service.get_logs(level="success")])
+
+    def test_save_config_normalizes_checkpoint_interval_to_one_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            config_path = base_dir / "config.yaml"
+            config_path.write_text("save_every: 5\nsave_every_n_products: 5\n", encoding="utf-8")
+            service = WebApiService(base_dir=base_dir, config_path=config_path)
+
+            service.save_config({"save_every": 9})
+
+            saved = config_path.read_text(encoding="utf-8")
+            self.assertNotIn("save_every:", saved)
+            self.assertIn("save_every_n_products: 9", saved)
+            self.assertEqual(service.get_config()["save_every"], 9)
 
     def test_save_config_returns_before_slow_schedule_sync_finishes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -309,6 +583,8 @@ class WebApiServiceTest(unittest.TestCase):
             self.assertIn("-EncodedCommand $encodedCommand", script)
             self.assertIn("Start-Process -FilePath", script)
             self.assertIn("-WindowStyle Hidden -Wait -PassThru", script)
+            self.assertIn("-RestartCount 3", script)
+            self.assertIn("-RestartInterval (New-TimeSpan -Minutes 10)", script)
             self.assertNotIn('$action = New-ScheduledTaskAction -Execute $runnerExe', script)
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 self.assertEqual(captured["kwargs"].get("creationflags"), subprocess.CREATE_NO_WINDOW)

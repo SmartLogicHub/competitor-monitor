@@ -1,7 +1,15 @@
 import unittest
 from datetime import date
+from unittest.mock import patch
 
-from bi_service import build_week_payload, normalize_shop_goods, wait_until_not_login_page
+from bi_service import (
+    BINewProductClient,
+    NEW_GOODS_ENDPOINT,
+    SHOP_TASK_ENDPOINT,
+    build_week_payload,
+    normalize_shop_goods,
+    wait_until_not_login_page,
+)
 from date_service import WorkWeek
 from new_product_service import NewProduct
 
@@ -93,6 +101,43 @@ class BIServiceTest(unittest.TestCase):
 
         self.assertTrue(finished)
         self.assertEqual(sleeps, [1, 1])
+
+    def test_shop_failure_is_retried_and_does_not_block_remaining_shops(self):
+        week = WorkWeek(monday=date(2026, 6, 29), friday=date(2026, 7, 3))
+        client = BINewProductClient(
+            {
+                "bi_request_retry_count": 1,
+                "bi_retry_min_delay_seconds": 0,
+                "bi_retry_max_delay_seconds": 0,
+            }
+        )
+        shops = [
+            {"shopId": "1", "shopName": "失败旗舰店", "newCount": 1},
+            {"shopId": "2", "shopName": "成功旗舰店", "newCount": 1},
+        ]
+        goods_attempts = {"1": 0, "2": 0}
+
+        def fake_post_json(_page, endpoint, payload):
+            if endpoint == SHOP_TASK_ENDPOINT:
+                return {"success": True, "data": shops}
+            self.assertEqual(endpoint, NEW_GOODS_ENDPOINT)
+            shop_id = payload["shopId"]
+            goods_attempts[shop_id] += 1
+            if shop_id == "1":
+                raise RuntimeError("temporary BI request failure")
+            return {"success": True, "data": []}
+
+        client._page = object()
+        client.post_json = fake_post_json
+        client.ensure_logged_in = lambda _page: None
+        with patch("bi_service.random_delay"):
+            result = client.collect_week_products(week)
+
+        self.assertEqual(goods_attempts, {"1": 2, "2": 1})
+        self.assertEqual(result.queried_shop_count, 2)
+        self.assertEqual(result.successful_shop_names, ("成功旗舰店",))
+        self.assertEqual(result.failed_shop_names, ("失败旗舰店",))
+        self.assertEqual(len(result.failure_details), 1)
 
 
 if __name__ == "__main__":

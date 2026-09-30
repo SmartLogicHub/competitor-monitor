@@ -106,6 +106,28 @@ class NewProductWriterTest(unittest.TestCase):
         self.assertEqual(ws["J13"].value, "无上新")
         self.assertIn("J13:S18", {str(rng) for rng in ws.merged_cells.ranges})
 
+    def test_authoritative_empty_result_replaces_stale_product_area_with_no_new(self):
+        _, ws = create_new_product_sheet()
+        layout = detect_new_product_layout(ws)
+        ws.unmerge_cells("J13:S18")
+        ws["J13"] = "6月16"
+        ws["K13"] = "上次残留型号"
+        ws["M13"] = "299"
+
+        stats = write_new_products(
+            ws,
+            layout,
+            {"华为": []},
+            no_data_text="无上新",
+            overwrite_empty_brands=True,
+        )
+
+        self.assertEqual(stats.no_data_brands, 1)
+        self.assertEqual(stats.no_data_written, 1)
+        self.assertEqual(ws["J13"].value, "无上新")
+        self.assertIsNone(ws["K13"].value)
+        self.assertIn("J13:S18", {str(rng) for rng in ws.merged_cells.ranges})
+
     def test_skips_duplicate_existing_link(self):
         _, ws = create_new_product_sheet()
         layout = detect_new_product_layout(ws)
@@ -220,6 +242,113 @@ class NewProductWriterTest(unittest.TestCase):
         self.assertEqual(ws["K6"].value, "H9")
         self.assertEqual(ws["K7"].value, None)
         self.assertIn("J7:S7", {str(rng) for rng in ws.merged_cells.ranges})
+
+    def test_appending_into_blank_merged_range_does_not_crash(self):
+        # Regression: a following brand's BI area can be a merged block with no
+        # "无上新" label (left over after the week template cleared the marker text).
+        # Appending a row into such a block must unmerge it, not crash on the
+        # read-only MergedCell value.
+        wb = Workbook()
+        ws = wb.active
+        ws["J1"] = "上新监控"
+        ws.merge_cells("J1:S1")
+        ws["J2"] = "上架日期"
+        ws.merge_cells("J2:J3")
+        ws["K2"] = "型号"
+        ws.merge_cells("K2:K3")
+        ws["L2"] = "形态"
+        ws.merge_cells("L2:L3")
+        ws["M2"] = "价格"
+        ws.merge_cells("M2:M3")
+        ws["N2"] = "直播价格"
+        ws.merge_cells("N2:R2")
+        ws["S2"] = "新卖点"
+        ws.merge_cells("S2:S3")
+        ws["A4"] = "索尼影音"
+        ws.merge_cells("A4:A5")
+        ws["K4"] = "existing-1"
+        ws["K5"] = "existing-2"
+        ws["A6"] = "华为"
+        ws.merge_cells("A6:A7")
+        ws.merge_cells("J6:S7")  # blank merged block, no "无上新" text
+        layout = detect_new_product_layout(ws)
+        product = NewProduct(
+            brand="索尼影音",
+            on_sale_date=date(2026, 7, 3),
+            model="H9",
+            shape="头戴式",
+            price="1969",
+            link="https://example.com/h9",
+            selling_point="/",
+            source_id="h9",
+            raw_name="Sony H9",
+        )
+
+        stats = write_new_products(ws, layout, {"索尼影音": [product]}, no_data_text="无上新")
+
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.written, 1)
+        self.assertEqual(ws["K6"].value, "H9")
+        self.assertEqual(ws["K6"].hyperlink.target, "https://example.com/h9")
+        self.assertNotIn("J6:S7", {str(rng) for rng in ws.merged_cells.ranges})
+
+    def test_overflow_brand_expands_its_own_section_instead_of_bleeding(self):
+        # 一个品牌的新品数量超过它分配的行数时，应整体插入行、扩展自己的 A 列标签，
+        # 并把后续品牌整体下移，而不是把多余新品写到下一家的行里。
+        wb = Workbook()
+        ws = wb.active
+        ws["J1"] = "上新监控"
+        ws.merge_cells("J1:S1")
+        ws["J2"] = "上架日期"
+        ws.merge_cells("J2:J3")
+        ws["K2"] = "型号"
+        ws.merge_cells("K2:K3")
+        ws["L2"] = "形态"
+        ws.merge_cells("L2:L3")
+        ws["M2"] = "价格"
+        ws.merge_cells("M2:M3")
+        ws["N2"] = "直播价格"
+        ws.merge_cells("N2:R2")
+        ws["S2"] = "新卖点"
+        ws.merge_cells("S2:S3")
+        ws["A4"] = "索尼影音"
+        ws.merge_cells("A4:A5")
+        ws["B4"] = "sony-mature-4"
+        ws["B5"] = "sony-mature-5"
+        ws["A6"] = "绿联"
+        ws.merge_cells("A6:A7")
+        ws["B6"] = "ugreen-mature-6"
+        ws["B7"] = "ugreen-mature-7"
+        layout = detect_new_product_layout(ws)
+        products = [
+            NewProduct(
+                brand="索尼影音",
+                on_sale_date=date(2026, 7, 3),
+                model=f"SONY-{i}",
+                shape="头戴式",
+                price="1969",
+                link=f"https://example.com/sony-{i}",
+                selling_point="/",
+                source_id=f"sony-{i}",
+                raw_name=f"Sony {i}",
+            )
+            for i in range(4)
+        ]
+
+        stats = write_new_products(ws, layout, {"索尼影音": products}, no_data_text="无上新")
+
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.written, 4)
+        # 索尼影音 A 列标签扩展到 4 行（A4:A7），4 条新品都在自己的区
+        self.assertIn("A4:A7", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertEqual(
+            [ws.cell(row=r, column=11).value for r in range(4, 8)],
+            ["SONY-0", "SONY-1", "SONY-2", "SONY-3"],
+        )
+        # 绿联整体下移：标签到 A8:A9，成熟型号也下移
+        self.assertIn("A8:A9", {str(rng) for rng in ws.merged_cells.ranges})
+        self.assertEqual(ws["B8"].value, "ugreen-mature-6")
+        self.assertEqual(ws["B9"].value, "ugreen-mature-7")
 
     def test_right_side_expansion_keeps_following_brand_ranges_shifted(self):
         wb = Workbook()

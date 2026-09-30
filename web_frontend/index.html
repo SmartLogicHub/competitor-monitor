@@ -184,6 +184,7 @@
             </div>
             <div class="task-actions">
               <button id="btn-run-weekly" class="btn secondary" type="button">手动运行 BI</button>
+              <button id="btn-rerun-weekly" class="btn secondary" type="button">补跑上次 BI</button>
               <button id="btn-backfill-missing" class="btn ghost" type="button">补跑缺失日期</button>
             </div>
             <div class="task-running-note" id="weekly-running-note" hidden>
@@ -502,6 +503,19 @@
                   </label>
                 </div>
                 <p class="account-save-hint">填写账号或密码后，请点击“保存账号与配置”。保存后密码不会明文显示。</p>
+                <div class="account-session-actions">
+                  <button id="btn-open-taobao-login" class="btn secondary" type="button">打开淘宝登录网页</button>
+                  <span id="taobao-login-browser-status" class="session-state-text" role="status">登录浏览器已关闭</span>
+                </div>
+                <p class="account-login-hint">将打开当前 Excel 中的真实天猫商品页；登录完成后直接关闭浏览器窗口，状态会保存给自动采集使用。</p>
+                <div class="account-session-actions">
+                  <label class="field">
+                    <span>导入 Cookie（仅本机 JSON）</span>
+                    <input id="taobao-cookie-upload-input" class="form-control" type="file" accept=".json,application/json">
+                  </label>
+                  <button id="btn-import-taobao-cookies" class="btn secondary" type="button">导入淘宝 Cookie</button>
+                </div>
+                <p class="account-login-hint">支持 storage_state.json 和 Cookie-Editor JSON。Cookie 有效时可免输账号密码；导入内容不会显示在页面或日志中。</p>
                 <button id="btn-reset-taobao" class="btn danger-subtle" type="button">清除淘宝浏览器状态</button>
                 <p class="danger-note">清除后下次运行可能需要重新登录，遇到验证码仍需人工处理。</p>
               </section>
@@ -549,7 +563,7 @@
             </div>
             <div class="settings-grid">
               <label class="field">运行模式<select id="cfg-mode" class="form-control"><option value="daily_price">daily_price</option><option value="weekly_new">weekly_new</option><option value="price_trend">price_trend</option><option value="all">all</option></select></label>
-              <label class="field">运行日期<input id="cfg-run-date" class="form-control" type="date"></label>
+              <label class="field">运行日期（自动使用电脑当天）<input id="cfg-run-date" class="form-control" type="date" readonly></label>
               <label class="field">只做安全检查<select id="cfg-dry-run" class="form-control"><option value="false">关闭</option><option value="true">开启 dry-run</option></select></label>
               <label class="field">只测试一条<select id="cfg-test-one" class="form-control"><option value="false">关闭</option><option value="true">开启 test-one</option></select></label>
               <label class="field">行范围<input id="cfg-rows" class="form-control" type="text" placeholder="如 24,54,60-62"></label>

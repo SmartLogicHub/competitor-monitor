@@ -64,6 +64,18 @@ class MainCollectionOptionsTest(unittest.TestCase):
         self.assertIs(updated, config)
         self.assertTrue(config["force_overwrite"])
 
+    def test_price_selection_summary_reports_when_starting_price_does_not_override_sku(self):
+        snapshot = SimpleNamespace(
+            price="107.95",
+            visible_promotion_price="108.8",
+            sku_candidate_price="107.95",
+            visible_text="W04 店铺优惠后 ￥108.8 起",
+        )
+
+        summary = main.price_selection_summary(snapshot)
+
+        self.assertEqual(summary, "页面优惠价为起价，保留已确认的SKU价格")
+
     def test_collect_with_retry_retries_until_success(self):
         browser = RetryBrowser(failures_before_success=2)
         collector = RetryCollector()
@@ -83,6 +95,109 @@ class MainCollectionOptionsTest(unittest.TestCase):
 
         self.assertEqual(browser.open_count, 3)
         self.assertEqual(collector.collect_count, 0)
+
+    def test_collect_with_retry_restarts_driver_and_retries_current_product(self):
+        browser = DisconnectThenSuccessBrowser()
+        collector = RetryCollector()
+
+        result = main.collect_with_retry(
+            browser,
+            collector,
+            "https://example.com/item",
+            retry_count=0,
+            browser_restart_retry_count=1,
+        )
+
+        self.assertEqual(result.price, "88.00")
+        self.assertEqual(browser.restart_count, 1)
+        self.assertEqual(browser.open_count, 2)
+
+    def test_collect_with_retry_ignores_stale_page_close_error_after_driver_restart(self):
+        browser = PageDisconnectThenSuccessBrowser()
+        collector = DisconnectingCollector()
+
+        result = main.collect_with_retry(
+            browser,
+            collector,
+            "https://example.com/item",
+            retry_count=0,
+            browser_restart_retry_count=1,
+        )
+
+        self.assertEqual(result.price, "88.00")
+        self.assertEqual(browser.restart_count, 1)
+
+    def test_collect_with_retry_raises_fatal_error_when_driver_recovery_is_exhausted(self):
+        browser = AlwaysDisconnectedBrowser()
+        collector = RetryCollector()
+
+        with self.assertRaises(main.BrowserSessionUnavailableError):
+            main.collect_with_retry(
+                browser,
+                collector,
+                "https://example.com/item",
+                retry_count=3,
+                browser_restart_retry_count=1,
+            )
+
+        self.assertEqual(browser.restart_count, 1)
+        self.assertEqual(browser.open_count, 2)
+
+    def test_collect_with_retry_retries_an_empty_snapshot_after_a_low_frequency_delay(self):
+        browser = RetryBrowser(failures_before_success=0)
+        collector = EmptyThenSuccessfulCollector()
+
+        with patch("main.random.uniform", return_value=22.5), patch("main.time.sleep") as sleep:
+            result = main.collect_with_retry(
+                browser,
+                collector,
+                "https://example.com/item",
+                retry_count=2,
+                empty_price_retry_count=1,
+                empty_price_retry_min_delay_seconds=15,
+                empty_price_retry_max_delay_seconds=30,
+            )
+
+        self.assertEqual(result.price, "998")
+        self.assertEqual(browser.open_count, 2)
+        self.assertEqual(collector.collect_count, 2)
+        sleep.assert_called_once_with(22.5)
+
+    def test_collect_with_retry_does_not_retry_an_explicitly_unavailable_page(self):
+        browser = RetryBrowser(failures_before_success=0)
+        collector = ExplicitlyUnavailableCollector()
+
+        result = main.collect_with_retry(
+            browser,
+            collector,
+            "https://example.com/item",
+            retry_count=2,
+            empty_price_retry_count=1,
+            empty_price_retry_min_delay_seconds=0,
+            empty_price_retry_max_delay_seconds=0,
+        )
+
+        self.assertTrue(result.explicitly_unavailable)
+        self.assertEqual(browser.open_count, 1)
+        self.assertEqual(collector.collect_count, 1)
+
+    def test_collect_with_retry_does_not_retry_a_confirmed_missing_package_variant(self):
+        browser = RetryBrowser(failures_before_success=0)
+        collector = SpecificVariantMissingCollector()
+
+        result = main.collect_with_retry(
+            browser,
+            collector,
+            "https://example.com/item",
+            retry_count=2,
+            empty_price_retry_count=1,
+            empty_price_retry_min_delay_seconds=0,
+            empty_price_retry_max_delay_seconds=0,
+        )
+
+        self.assertTrue(result.model_variant_missing)
+        self.assertEqual(browser.open_count, 1)
+        self.assertEqual(collector.collect_count, 1)
 
 
 class RunCollectionCheckpointTest(unittest.TestCase):
@@ -509,11 +624,12 @@ class RunCollectionCheckpointTest(unittest.TestCase):
 
         self.assertEqual(main.latest_previous_price(ws, layout, 4), "109.65")
 
-    def test_run_collection_uses_previous_price_when_collection_is_uncertain(self):
+    def test_run_collection_does_not_write_previous_price_when_collection_is_uncertain(self):
         wb = Workbook()
         ws = wb.active
         layout = SimpleNamespace(price_column=7, activity_column=9, date_price_columns=[3, 4, 5, 6, 7])
         ws.cell(row=4, column=5).value = "442"
+        ws.cell(row=4, column=9).value = "国补"
         products = [SimpleNamespace(row=4, brand="Sanag", name="S7S", url="https://detail.tmall.com/item.htm?id=1")]
         excel = FakeExcel(reload_layout=layout)
         logger = logging.getLogger("test_run_collection_uses_previous_price_when_collection_is_uncertain")
@@ -542,11 +658,12 @@ class RunCollectionCheckpointTest(unittest.TestCase):
                         target_date=date(2026, 7, 3),
                     )
 
-        self.assertEqual(stats.success, 1)
-        self.assertEqual(stats.failed, 0)
-        self.assertEqual(ws.cell(row=4, column=7).value, "442")
+        self.assertEqual(stats.success, 0)
+        self.assertEqual(stats.failed, 1)
+        self.assertIsNone(ws.cell(row=4, column=7).value)
+        self.assertEqual(ws.cell(row=4, column=9).value, "国补")
 
-    def test_run_collection_uses_previous_sheet_price_when_current_week_has_no_history(self):
+    def test_run_collection_does_not_write_previous_sheet_price_when_current_week_has_no_history(self):
         wb = Workbook()
         previous_ws = wb.active
         create_mature_price_sheet(
@@ -590,9 +707,9 @@ class RunCollectionCheckpointTest(unittest.TestCase):
                         target_date=date(2026, 6, 29),
                     )
 
-        self.assertEqual(stats.success, 1)
-        self.assertEqual(stats.failed, 0)
-        self.assertEqual(current_ws.cell(row=4, column=3).value, "442")
+        self.assertEqual(stats.success, 0)
+        self.assertEqual(stats.failed, 1)
+        self.assertIsNone(current_ws.cell(row=4, column=3).value)
 
     def test_manual_price_override_beats_wrong_recent_history_for_known_problem_product(self):
         wb = Workbook()
@@ -633,6 +750,166 @@ class RunCollectionCheckpointTest(unittest.TestCase):
         self.assertEqual(stats.success, 1)
         self.assertEqual(stats.failed, 0)
         self.assertEqual(ws.cell(row=4, column=7).value, "109.65")
+
+    def test_run_collection_writes_slash_when_specific_model_variant_is_missing(self):
+        wb = Workbook()
+        ws = wb.active
+        layout = SimpleNamespace(price_column=3, activity_column=9, date_price_columns=[3])
+        ws.cell(row=4, column=3).value = "391.76"
+        products = [
+            SimpleNamespace(
+                row=4,
+                brand="\u585e\u90a3",
+                name="S7S Ultra 520\u544a\u767d\u793c\u76d2",
+                url="https://detail.tmall.com/item.htm?id=843253121864",
+            )
+        ]
+        excel = FakeExcel(reload_layout=layout)
+        logger = logging.getLogger("test_run_collection_writes_slash_when_specific_model_variant_is_missing")
+
+        with patch.object(main, "BrowserService", FakeBrowserService):
+            with patch.object(
+                main,
+                "collect_with_retry",
+                return_value=SimpleNamespace(
+                    price=None,
+                    activities=[],
+                    visible_text="S7S Ultra \u5b98\u65b9\u6807\u914d",
+                    model_variant_missing=True,
+                ),
+            ):
+                stats = main.run_collection(
+                    config={
+                        "min_delay_seconds": 0,
+                        "max_delay_seconds": 0,
+                        "retry_count": 0,
+                        "enable_sku_matching": True,
+                    },
+                    logger=logger,
+                    excel=excel,
+                    workbook=wb,
+                    worksheet=ws,
+                    layout=layout,
+                    products=products,
+                    test_one=False,
+                    limit=None,
+                    row_filter=None,
+                    save_every=0,
+                    excel_path=None,
+                    target_date=date(2026, 7, 21),
+                )
+
+        self.assertEqual(stats.success, 1)
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(ws.cell(row=4, column=3).value, "/")
+        self.assertEqual(ws.cell(row=4, column=9).value, "/")
+
+    def test_run_collection_does_not_write_slash_when_page_model_is_unconfirmed(self):
+        wb = Workbook()
+        ws = wb.active
+        layout = SimpleNamespace(price_column=3, activity_column=9, date_price_columns=[3])
+        ws.cell(row=4, column=9).value = "国补"
+        products = [
+            SimpleNamespace(
+                row=4,
+                brand="索尼",
+                name="WH-1000XM5",
+                url="https://detail.tmall.com/item.htm?id=sony",
+            )
+        ]
+        excel = FakeExcel(reload_layout=layout)
+        logger = logging.getLogger("test_run_collection_does_not_write_slash_when_page_model_is_unconfirmed")
+
+        with patch.object(main, "BrowserService", FakeBrowserService):
+            with patch.object(
+                main,
+                "collect_with_retry",
+                return_value=SimpleNamespace(
+                    price="2999",
+                    activities=["超级立减"],
+                    visible_text="其他型号耳机 店铺优惠后 ￥2999",
+                    model_variant_missing=False,
+                    explicitly_unavailable=False,
+                ),
+            ):
+                stats = main.run_collection(
+                    config={
+                        "min_delay_seconds": 0,
+                        "max_delay_seconds": 0,
+                        "retry_count": 0,
+                        "enable_sku_matching": True,
+                    },
+                    logger=logger,
+                    excel=excel,
+                    workbook=wb,
+                    worksheet=ws,
+                    layout=layout,
+                    products=products,
+                    test_one=False,
+                    limit=None,
+                    row_filter=None,
+                    save_every=0,
+                    excel_path=None,
+                    target_date=date(2026, 7, 22),
+                )
+
+        self.assertEqual(stats.success, 0)
+        self.assertEqual(stats.failed, 1)
+        self.assertIsNone(ws.cell(row=4, column=3).value)
+        self.assertEqual(ws.cell(row=4, column=9).value, "国补")
+
+    def test_run_collection_writes_slash_only_for_explicitly_unavailable_page(self):
+        wb = Workbook()
+        ws = wb.active
+        layout = SimpleNamespace(price_column=3, activity_column=9, date_price_columns=[3])
+        products = [
+            SimpleNamespace(
+                row=4,
+                brand="索尼",
+                name="WH-1000XM5",
+                url="https://detail.tmall.com/item.htm?id=sony",
+            )
+        ]
+        excel = FakeExcel(reload_layout=layout)
+        logger = logging.getLogger("test_run_collection_writes_slash_only_for_explicitly_unavailable_page")
+
+        with patch.object(main, "BrowserService", FakeBrowserService):
+            with patch.object(
+                main,
+                "collect_with_retry",
+                return_value=SimpleNamespace(
+                    price=None,
+                    activities=[],
+                    visible_text="Sony WH-1000XM5 此商品已下架",
+                    model_variant_missing=False,
+                    explicitly_unavailable=True,
+                ),
+            ):
+                stats = main.run_collection(
+                    config={
+                        "min_delay_seconds": 0,
+                        "max_delay_seconds": 0,
+                        "retry_count": 0,
+                        "enable_sku_matching": True,
+                    },
+                    logger=logger,
+                    excel=excel,
+                    workbook=wb,
+                    worksheet=ws,
+                    layout=layout,
+                    products=products,
+                    test_one=False,
+                    limit=None,
+                    row_filter=None,
+                    save_every=0,
+                    excel_path=None,
+                    target_date=date(2026, 7, 22),
+                )
+
+        self.assertEqual(stats.success, 1)
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(ws.cell(row=4, column=3).value, "/")
+        self.assertEqual(ws.cell(row=4, column=9).value, "/")
 
     def test_detect_price_change_alert_for_large_price_drop(self):
         wb = Workbook()
@@ -720,7 +997,7 @@ class RunCollectionCheckpointTest(unittest.TestCase):
         self.assertEqual(ws.cell(row=82, column=3).value, "1699")
         self.assertEqual(ws.cell(row=82, column=9).value, "\u8ddf\u4ef7\u534f\u8bae")
 
-    def test_run_collection_marks_slash_when_page_no_longer_contains_target_model(self):
+    def test_run_collection_writes_slash_when_loaded_page_has_replaced_target_model(self):
         wb = Workbook()
         ws = wb.active
         ws.title = "7.6-7.10"
@@ -734,11 +1011,14 @@ class RunCollectionCheckpointTest(unittest.TestCase):
             )
         ]
         excel = FakeExcel(reload_layout=layout)
-        logger = logging.getLogger("test_run_collection_marks_slash_when_page_no_longer_contains_target_model")
+        logger = logging.getLogger("test_run_collection_writes_slash_when_loaded_page_has_replaced_target_model")
         snapshot = SimpleNamespace(
             price=None,
             activities=[],
-            visible_text="\u7eff\u8054Q3\u84dd\u7259\u8033\u673a \u578b\u53f7 WS212 \uffe5439",
+            visible_text=(
+                "绿联Q3蓝牙耳机\n参数信息\n品牌\n绿联\n型号\nWS212\n"
+                "图文详情\n绿联Q3蓝牙耳机\n￥\n439\n热卖中"
+            ),
         )
 
         with patch.object(main, "BrowserService", FakeBrowserService):
@@ -947,7 +1227,36 @@ class WeeklyNewProductModeTest(unittest.TestCase):
                 )
 
             collect_bi.assert_not_called()
-            self.assertEqual(stats, NewProductWriteStats())
+            self.assertTrue(stats.skipped)
+
+    def test_manual_weekly_new_products_runs_even_when_sunday_schedule_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            excel_path = Path(tmpdir) / "monitor.xlsx"
+            create_weekly_new_workbook(excel_path)
+            excel = ExcelService(excel_path)
+            workbook = excel.load_workbook()
+            result = BICollectResult(products=[], total_shop_count=2, queried_shop_count=0, total_goods_count=0)
+
+            with patch.object(main, "collect_bi_new_products", return_value=result) as collect_bi:
+                stats = main.run_weekly_new_products(
+                    config={
+                        "new_product_enabled": True,
+                        "new_product_allowed_weekdays": [5],
+                        "new_product_no_data_text": "无上新",
+                        "auto_backfill_missing_daily_prices_before_weekly_new": False,
+                    },
+                    logger=logging.getLogger("test_manual_weekly_new_runs_on_sunday"),
+                    excel=excel,
+                    workbook=workbook,
+                    run_date=date(2026, 7, 5),
+                    dry_run=False,
+                    excel_path=excel_path,
+                    manual_run=True,
+                )
+
+            collect_bi.assert_called_once()
+            self.assertFalse(stats.skipped)
+            self.assertEqual(stats.no_data_brands, 2)
 
     def test_run_weekly_new_products_writes_bi_products_and_no_new_brands(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1227,7 +1536,7 @@ class FakeBrowserService:
         self.login_checked = True
 
 
-def fake_collect_with_retry(browser, collector, url, retry_count, expected_model=None, allow_fallback_price=True):
+def fake_collect_with_retry(browser, collector, url, retry_count, expected_model=None, allow_fallback_price=True, **kwargs):
     return SimpleNamespace(price="99.00", activities="国补")
 
 
@@ -1252,9 +1561,92 @@ class RetryCollector:
         return SimpleNamespace(price="88.00", activities="国补")
 
 
+class EmptyThenSuccessfulCollector:
+    def __init__(self):
+        self.collect_count = 0
+
+    def collect_from_page(self, page, expected_model=None, allow_fallback_price=True):
+        self.collect_count += 1
+        if self.collect_count == 1:
+            return SimpleNamespace(price=None, activities=["/"])
+        return SimpleNamespace(price="998", activities=["超级立减"])
+
+
+class ExplicitlyUnavailableCollector:
+    def __init__(self):
+        self.collect_count = 0
+
+    def collect_from_page(self, page, expected_model=None, allow_fallback_price=True):
+        self.collect_count += 1
+        return SimpleNamespace(
+            price=None,
+            activities=[],
+            explicitly_unavailable=True,
+            model_variant_missing=False,
+        )
+
+
+class SpecificVariantMissingCollector:
+    def __init__(self):
+        self.collect_count = 0
+
+    def collect_from_page(self, page, expected_model=None, allow_fallback_price=True):
+        self.collect_count += 1
+        return SimpleNamespace(
+            price=None,
+            activities=[],
+            explicitly_unavailable=False,
+            model_variant_missing=True,
+        )
+
+
 class RetryPage:
     def close(self):
         pass
+
+
+class DisconnectThenSuccessBrowser:
+    def __init__(self):
+        self.open_count = 0
+        self.restart_count = 0
+
+    def open_page(self, _url):
+        self.open_count += 1
+        if self.open_count == 1:
+            raise RuntimeError("BrowserContext.new_page: Connection closed while reading from the driver")
+        return RetryPage()
+
+    def restart_after_disconnect(self):
+        self.restart_count += 1
+
+    @staticmethod
+    def is_disconnect_error(exc):
+        return "Connection closed while reading from the driver" in str(exc)
+
+
+class AlwaysDisconnectedBrowser(DisconnectThenSuccessBrowser):
+    def open_page(self, _url):
+        self.open_count += 1
+        raise RuntimeError("BrowserContext.new_page: Connection closed while reading from the driver")
+
+
+class PageDisconnectThenSuccessBrowser(DisconnectThenSuccessBrowser):
+    def open_page(self, _url):
+        self.open_count += 1
+        return FailingClosePage() if self.open_count == 1 else RetryPage()
+
+
+class FailingClosePage:
+    def close(self):
+        raise RuntimeError("Target page, context or browser has been closed")
+
+
+class DisconnectingCollector(RetryCollector):
+    def collect_from_page(self, page, expected_model=None, allow_fallback_price=True):
+        self.collect_count += 1
+        if self.collect_count == 1:
+            raise RuntimeError("Connection closed while reading from the driver")
+        return SimpleNamespace(price="88.00", activities="国补")
 
 
 def create_weekly_new_workbook(path: Path) -> None:
