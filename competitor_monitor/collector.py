@@ -293,10 +293,12 @@ class ProductCollector:
             return False
         if re.search(r"请登录|登录后|安全验证|滑动验证|访问被拒绝|网络异常", text):
             return False
+        # Possessive quantifiers keep this linear: the previous \s*…\s+…\s* chain
+        # backtracked cubically on long newline runs and could hang a run for hours.
         model_match = re.search(
-            r"(?:^|\n)\s*型号\s*(?:[:：]\s*)?(?:\n|\s+)\s*([^\n￥¥]{1,60})",
+            r"^[^\S\n]*型号(?:\s*+[:：])?\s++([^\n￥¥]{1,60})",
             text,
-            flags=re.IGNORECASE,
+            flags=re.IGNORECASE | re.MULTILINE,
         )
         if not model_match or not normalize_sku_text(model_match.group(1)):
             return False

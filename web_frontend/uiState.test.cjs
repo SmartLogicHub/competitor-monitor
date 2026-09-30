@@ -56,6 +56,24 @@ test("complete template promotes send-template", () => {
   assert.equal(view.statusLabel, "完整");
 });
 
+test("only history missing never offers a backfill because past prices cannot be collected", () => {
+  const historyOnly = { ...missingFriday, backfillable_dates: [], past_missing_dates: ["2026-07-03"] };
+
+  const view = buildAutomationView(baseTasks, historyOnly);
+
+  assert.equal(view.primaryAction, "send_template");
+  assert.match(view.message, /历史价格无法补采/);
+});
+
+test("today's missing prices offer a backfill of today only", () => {
+  const todayMissing = { ...missingFriday, backfillable_dates: ["2026-07-03"], past_missing_dates: [] };
+
+  const view = buildAutomationView(baseTasks, todayMissing);
+
+  assert.equal(view.primaryAction, "backfill");
+  assert.match(view.message, /今天（2026-07-03）/);
+});
+
 test("status helpers expose the shared feedback language", () => {
   assert.equal(statusTone("running"), "active");
   assert.equal(statusTone("template_error"), "danger");

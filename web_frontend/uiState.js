@@ -21,7 +21,17 @@
     const complete = Boolean(completeness.complete) && missingDates.length === 0;
     const energyPercent = completeness.energy_percent ?? calculateEnergyPercent(completeness.days || []);
     const tone = running ? "active" : complete ? "success" : missingDates.length ? "warning" : statusTone(systemStatus);
-    const primaryAction = running ? "none" : missingDates.length ? "backfill" : complete ? "send_template" : "run_daily";
+    // Only today's column can still be collected; backends that report backfillable_dates
+    // decide the action from it so past or not-yet-due days never trigger a backfill.
+    const hasTodayInfo = Array.isArray(completeness.backfillable_dates);
+    const backfillableDates = hasTodayInfo ? completeness.backfillable_dates : missingDates;
+    const primaryAction = running
+      ? "none"
+      : backfillableDates.length
+        ? "backfill"
+        : complete || hasTodayInfo
+          ? "send_template"
+          : "run_daily";
     const statusLabel = running ? statusText(systemStatus) : complete ? "完整" : missingDates.length ? `缺 ${missingDates.length} 天` : statusText(systemStatus);
     return {
       sheetName: completeness.sheet_name || "未创建 sheet",
@@ -34,7 +44,7 @@
       missingDates,
       days: normalizeDays(completeness.days || [], running),
       steps: normalizeWorkflow(tasksStatus.workflow || [], systemStatus),
-      message: automationMessage(systemStatus, complete, missingDates)
+      message: automationMessage(systemStatus, complete, hasTodayInfo ? backfillableDates : missingDates, completeness.past_missing_dates || [])
     };
   }
 
@@ -84,15 +94,16 @@
     });
   }
 
-  function automationMessage(systemStatus, complete, missingDates) {
+  function automationMessage(systemStatus, complete, missingDates, historyDates = []) {
     if (systemStatus === "running") return "任务正在执行，系统会持续写入主 Excel 模板。";
-    if (systemStatus === "backfilling") return "正在补跑缺失日期，完成后继续后续任务。";
+    if (systemStatus === "backfilling") return "正在补跑今天还没有价格的商品。";
     if (systemStatus === "saving") return "主模板正在保存。";
     if (systemStatus === "sending") return "正在发送企业微信摘要和 Excel 文件。";
     if (systemStatus === "failed") return "任务失败，请查看最近日志中的失败原因。";
     if (systemStatus === "partial_success") return "任务已完成，但有部分项目失败；可查看失败记录后补跑。";
     if (complete) return "周一到周五价格列已完整，可以发送当前模板。";
-    if (missingDates.length) return `缺失日期：${missingDates.join("、")}，建议先补跑。`;
+    if (missingDates.length) return `今天（${missingDates.join("、")}）还有商品没有价格，可以补跑今天。`;
+    if (historyDates.length) return `历史日期 ${historyDates.join("、")} 缺价格，历史价格无法补采。`;
     return "系统待命，等待下一次自动任务。";
   }
 

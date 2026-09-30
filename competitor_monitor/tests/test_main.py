@@ -2,6 +2,7 @@ import logging
 import io
 import tempfile
 import threading
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from openpyxl import Workbook, load_workbook
 
 import main
+from collector import ProductCollector
 from bi_service import BICollectResult
 from excel_service import ExcelService
 from new_product_service import NewProduct
@@ -317,6 +319,74 @@ class RunCollectionCheckpointTest(unittest.TestCase):
 
         self.assertEqual(stats.success, 3)
         self.assertEqual(excel.saved_paths, ["monitor.xlsx", "monitor.xlsx"])
+
+    def _run_three_products(self, ws, excel, collect, config_overrides=None, save_every=5):
+        layout = SimpleNamespace(price_column=3, activity_column=9)
+        products = [
+            SimpleNamespace(row=4, brand="A", name="P1", url="https://example.com/1"),
+            SimpleNamespace(row=5, brand="A", name="P2", url="https://example.com/2"),
+            SimpleNamespace(row=6, brand="A", name="P3", url="https://example.com/3"),
+        ]
+        config = {"min_delay_seconds": 0, "max_delay_seconds": 0, "retry_count": 0, "enable_sku_matching": False}
+        config.update(config_overrides or {})
+        with patch.object(main, "BrowserService", FakeBrowserService):
+            with patch.object(main, "collect_with_retry", side_effect=collect) as collect_mock:
+                with patch.object(main.time, "sleep"):
+                    stats = main.run_collection(
+                        config=config,
+                        logger=logging.getLogger("test_run_three_products"),
+                        excel=excel,
+                        workbook=ws.parent,
+                        worksheet=ws,
+                        layout=layout,
+                        products=products,
+                        test_one=False,
+                        save_every=save_every,
+                        excel_path="monitor.xlsx",
+                        target_date=date(2026, 7, 3),
+                    )
+        return stats, collect_mock
+
+    def test_run_collection_skips_rows_with_price_already_filled_without_opening_page(self):
+        ws = Workbook().active
+        ws.cell(row=4, column=3).value = "88"
+        ws.cell(row=5, column=3).value = "/"
+        excel = FakeExcel()
+
+        stats, collect_mock = self._run_three_products(ws, excel, fake_collect_with_retry)
+
+        self.assertEqual(collect_mock.call_count, 1)
+        self.assertEqual(collect_mock.call_args.args[2], "https://example.com/3")
+        self.assertEqual((stats.success, stats.skipped, stats.failed), (1, 2, 0))
+        self.assertEqual(ws.cell(row=4, column=3).value, "88")
+        self.assertEqual(ws.cell(row=6, column=3).value, "99.00")
+
+    def test_run_collection_rechecks_filled_rows_when_force_overwrite(self):
+        ws = Workbook().active
+        ws.cell(row=4, column=3).value = "88"
+        excel = FakeExcel()
+
+        _stats, collect_mock = self._run_three_products(
+            ws, excel, fake_collect_with_retry, config_overrides={"force_overwrite": True}
+        )
+
+        self.assertEqual(collect_mock.call_count, 3)
+
+    def test_run_collection_saves_completed_rows_before_aborting_on_browser_failure(self):
+        ws = Workbook().active
+        excel = FakeExcel()
+
+        def collect(browser, collector, url, *args, **kwargs):
+            if url.endswith("/3"):
+                raise main.BrowserSessionUnavailableError("driver gone")
+            return fake_collect_with_retry(browser, collector, url, *args, **kwargs)
+
+        with self.assertRaises(main.BrowserSessionUnavailableError):
+            self._run_three_products(ws, excel, collect, save_every=5)
+
+        self.assertEqual(excel.saved_paths, ["monitor.xlsx"])
+        self.assertEqual(ws.cell(row=4, column=3).value, "99.00")
+        self.assertEqual(ws.cell(row=5, column=3).value, "99.00")
 
     def test_run_collection_reloads_workbook_after_each_checkpoint(self):
         wb = Workbook()
@@ -784,6 +854,7 @@ class RunCollectionCheckpointTest(unittest.TestCase):
                         "max_delay_seconds": 0,
                         "retry_count": 0,
                         "enable_sku_matching": True,
+                        "force_overwrite": True,
                     },
                     logger=logger,
                     excel=excel,
@@ -1243,7 +1314,6 @@ class WeeklyNewProductModeTest(unittest.TestCase):
                         "new_product_enabled": True,
                         "new_product_allowed_weekdays": [5],
                         "new_product_no_data_text": "无上新",
-                        "auto_backfill_missing_daily_prices_before_weekly_new": False,
                     },
                     logger=logging.getLogger("test_manual_weekly_new_runs_on_sunday"),
                     excel=excel,
@@ -1299,7 +1369,6 @@ class WeeklyNewProductModeTest(unittest.TestCase):
                     config={
                         "new_product_enabled": True,
                         "new_product_no_data_text": "无上新",
-                        "auto_backfill_missing_daily_prices_before_weekly_new": False,
                     },
                     logger=logger,
                     excel=excel,
@@ -1319,46 +1388,30 @@ class WeeklyNewProductModeTest(unittest.TestCase):
             self.assertEqual(ws["J8"].value, "无上新")
 
 
-    def test_run_weekly_new_products_backfills_missing_price_dates_before_bi(self):
+    def test_run_weekly_new_products_does_not_collect_prices_for_past_dates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             excel_path = Path(tmpdir) / "monitor.xlsx"
             create_weekly_new_workbook(excel_path)
             excel = ExcelService(excel_path)
             workbook = excel.load_workbook()
             result = BICollectResult(products=[], total_shop_count=2, queried_shop_count=2, total_goods_count=0)
-            logger = logging.getLogger("test_weekly_new_backfills_missing_price_dates")
-            attempted_dates = []
+            logger = logging.getLogger("test_weekly_new_does_not_collect_past_prices")
 
-            def fake_backfill(**kwargs):
-                missing_date = kwargs["run_date"]
-                attempted_dates.append(missing_date)
-                saved = load_workbook(excel_path)
-                ws = saved["6.29-7.3"]
-                column_by_date = {
-                    date(2026, 7, 1): 5,
-                    date(2026, 7, 2): 6,
-                    date(2026, 7, 3): 7,
-                }
-                ws.cell(row=4, column=column_by_date[missing_date]).value = "299.00"
-                saved.save(excel_path)
-                return main.RunStats(total=1, success=1)
-
-            with patch.object(main, "run_daily_price_job", side_effect=fake_backfill):
+            with patch.object(main, "run_daily_price_job") as daily_job:
                 with patch.object(main, "collect_bi_new_products", return_value=result):
-                    main.run_weekly_new_products(
-                        config={"new_product_enabled": True, "new_product_no_data_text": "无上新"},
-                        logger=logger,
-                        excel=excel,
-                        workbook=workbook,
-                        run_date=date(2026, 7, 5),
-                        dry_run=False,
-                        excel_path=excel_path,
-                    )
+                    with self.assertLogs(logger, level="WARNING") as logs:
+                        main.run_weekly_new_products(
+                            config={"new_product_enabled": True, "new_product_no_data_text": "无上新"},
+                            logger=logger,
+                            excel=excel,
+                            workbook=workbook,
+                            run_date=date(2026, 7, 5),
+                            dry_run=False,
+                            excel_path=excel_path,
+                        )
 
-            self.assertEqual(
-                attempted_dates,
-                [date(2026, 7, 1), date(2026, 7, 2), date(2026, 7, 3)],
-            )
+            daily_job.assert_not_called()
+            self.assertTrue(any("历史日期无法补采" in line for line in logs.output))
 
 
 class PriceTrendModeTest(unittest.TestCase):
@@ -1706,6 +1759,44 @@ def create_mature_price_sheet(worksheet, title, date_headers, row, brand, model,
     model_cell.hyperlink = "https://example.com/item"
     for column_offset, price in enumerate(prices, start=3):
         worksheet.cell(row=row, column=column_offset).value = price
+
+
+class ProductHangGuardTest(unittest.TestCase):
+    def test_model_line_regex_stays_fast_on_long_newline_runs(self):
+        text = "参数信息\n图文详情\n型号" + "\n" * 30000 + "￥199"
+        started = time.perf_counter()
+        result = ProductCollector.page_confirms_different_product("T770NC", text)
+        self.assertLess(time.perf_counter() - started, 1.0)
+        self.assertFalse(result)
+
+    def test_model_line_regex_still_reads_value_on_next_line(self):
+        text = "参数信息\n用户评价\n型号\n\nWH-1000XM5\n￥1699"
+        self.assertTrue(ProductCollector.page_confirms_different_product("T770NC", text))
+
+    def test_watchdog_dumps_stack_when_product_runs_too_long(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dump_path = Path(tmp) / "run.hang.txt"
+            with main.ProductWatchdog(0.2, dump_path) as watchdog:
+                watchdog.arm("row=69 T770NC")
+                time.sleep(0.6)
+            content = dump_path.read_text(encoding="utf-8")
+        self.assertIn("row=69 T770NC", content)
+        self.assertIn("Thread", content)
+        self.assertIn("test_watchdog_dumps_stack_when_product_runs_too_long", content)
+
+    def test_watchdog_leaves_no_file_when_products_finish_in_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dump_path = Path(tmp) / "run.hang.txt"
+            with main.ProductWatchdog(5, dump_path) as watchdog:
+                watchdog.arm("row=4 P1")
+            self.assertFalse(dump_path.exists())
+
+    def test_watchdog_disabled_when_timeout_is_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dump_path = Path(tmp) / "run.hang.txt"
+            with main.ProductWatchdog(0, dump_path) as watchdog:
+                watchdog.arm("row=4 P1")
+            self.assertFalse(dump_path.exists())
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ price_alert_enabled: true
 price_alert_threshold_percent: 20
 price_alert_min_abs_diff: 20
 skip_when_previous_prices_all_slash: false
+skip_filled_price_rows: true
 fallback_to_previous_price_when_uncertain: false
 
 headless: false
@@ -56,6 +57,7 @@ empty_price_retry_count: 1
 empty_price_retry_min_delay_seconds: 15
 empty_price_retry_max_delay_seconds: 30
 browser_restart_retry_count: 2
+product_hang_timeout_seconds: 1800
 browser_restart_min_delay_seconds: 3
 browser_restart_max_delay_seconds: 8
 
@@ -71,7 +73,6 @@ taobao_credentials_path: "competitor_monitor/secrets/taobao_credentials.json"
 
 new_product_enabled: true
 new_product_mode: "bi"
-auto_backfill_missing_daily_prices_before_weekly_new: true
 new_product_allowed_weekdays:
   - 5
   - 6

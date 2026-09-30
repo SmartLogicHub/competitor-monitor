@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import logging
 import random
@@ -348,16 +349,7 @@ def run_weekly_new_products(
     week = get_previous_completed_work_week(run_date)
     sheet_date = week.monday
     worksheet = excel.get_or_create_current_sheet(workbook, sheet_date)
-    workbook, worksheet = ensure_weekly_price_completeness_before_bi(
-        config=config,
-        logger=logger,
-        excel=excel,
-        workbook=workbook,
-        run_date=run_date,
-        sheet_date=sheet_date,
-        dry_run=dry_run,
-        excel_path=excel_path,
-    )
+    report_weekly_price_completeness_before_bi(logger, excel, workbook, sheet_date)
     layout = detect_new_product_layout(worksheet)
     heal_stats = heal_new_product_area(worksheet, layout)
     if heal_stats["cleared_urls"] or heal_stats["unmerged_blocks"]:
@@ -449,87 +441,19 @@ def run_weekly_new_products(
     return stats
 
 
-def ensure_weekly_price_completeness_before_bi(
-    config,
-    logger,
-    excel,
-    workbook,
-    run_date: date,
-    sheet_date: date,
-    dry_run: bool,
-    excel_path: Path,
-):
-    worksheet = excel.get_or_create_current_sheet(workbook, sheet_date)
+def report_weekly_price_completeness_before_bi(logger, excel, workbook, sheet_date: date) -> None:
+    """Report the price area's gaps for the BI week without touching it.
+
+    The weekly BI job only owns the new-product area. Past dates' prices cannot be
+    re-collected (product pages only show today's price), so gaps are just logged.
+    """
     completeness = excel.check_weekly_price_completeness(workbook, sheet_date)
     log_template_completeness(logger, "before BI", completeness)
-    if completeness.is_complete:
-        return workbook, worksheet
-
-    missing_dates = list(completeness.backfillable_dates)
-    if not missing_dates:
+    if not completeness.is_complete:
         logger.warning(
-            "Template price completeness has non-backfillable errors before weekly BI: %s",
+            "上周价格监控区有缺失日期：%s；历史日期无法补采，BI 上新照常进行",
             format_dates(completeness.missing_dates),
         )
-        return workbook, worksheet
-
-    if not bool(config.get("auto_backfill_missing_daily_prices_before_weekly_new", True)):
-        logger.warning(
-            "Weekly BI price backfill is disabled; missing dates remain: %s",
-            format_dates(missing_dates),
-        )
-        return workbook, worksheet
-
-    if dry_run:
-        logger.info(
-            "Dry-run mode: missing price dates are reported but not backfilled: %s",
-            format_dates(missing_dates),
-        )
-        return workbook, worksheet
-
-    failed_dates: list[date] = []
-    for missing_date in missing_dates:
-        logger.info("Backfilling missing daily price date before weekly BI: %s", missing_date.isoformat())
-        try:
-            backfill_workbook = excel.load_workbook()
-            stats = run_daily_price_job(
-                config=config,
-                logger=logger,
-                excel=excel,
-                workbook=backfill_workbook,
-                run_date=missing_date,
-                dry_run=False,
-                test_one=False,
-                limit=None,
-                row_filter=None,
-                save_every=config.get("save_every_n_products", config.get("save_every", 5)),
-                excel_path=excel_path,
-            )
-            if stats.failed:
-                failed_dates.append(missing_date)
-                logger.warning(
-                    "Backfill completed with failed items for %s: total=%s success=%s failed=%s",
-                    missing_date.isoformat(),
-                    stats.total,
-                    stats.success,
-                    stats.failed,
-                )
-        except Exception as exc:
-            failed_dates.append(missing_date)
-            logger.exception("Backfill failed for %s before weekly BI: %s", missing_date.isoformat(), exc)
-
-    workbook = excel.load_workbook()
-    worksheet = excel.get_or_create_current_sheet(workbook, sheet_date)
-    final_completeness = excel.check_weekly_price_completeness(workbook, sheet_date)
-    log_template_completeness(logger, "after BI backfill", final_completeness)
-    remaining_missing_dates = list(final_completeness.missing_dates)
-    if failed_dates or remaining_missing_dates:
-        logger.warning(
-            "Weekly BI will continue with incomplete price data; failed_backfill_dates=%s remaining_missing_dates=%s",
-            format_dates(failed_dates),
-            format_dates(remaining_missing_dates),
-        )
-    return workbook, worksheet
 
 
 def log_template_completeness(logger, phase: str, completeness) -> None:
@@ -579,6 +503,62 @@ def _config_weekdays(value) -> list[int]:
     return weekdays or [5, 6]
 
 
+class ProductWatchdog:
+    """Dump all thread stacks (and optionally exit) if one product runs too long.
+
+    faulthandler fires from a C-level thread, so it still works when the collector
+    thread is stuck in a regex or other C call that never releases the GIL.
+    """
+
+    def __init__(self, timeout_seconds: float, dump_path: Path | None, exit_process: bool = False):
+        self.timeout_seconds = float(timeout_seconds or 0)
+        self.dump_path = dump_path
+        self.exit_process = exit_process
+        self._file = None
+
+    def __enter__(self):
+        if self.timeout_seconds > 0 and self.dump_path is not None:
+            try:
+                self.dump_path.parent.mkdir(parents=True, exist_ok=True)
+                self._file = open(self.dump_path, "a", encoding="utf-8")
+            except OSError:
+                self._file = None
+        return self
+
+    def arm(self, label: str = "") -> None:
+        if self._file is None:
+            return
+        self._file.write(f"\n# {datetime.now().isoformat(timespec='seconds')} armed {self.timeout_seconds:.0f}s: {label}\n")
+        self._file.flush()
+        faulthandler.dump_traceback_later(
+            self.timeout_seconds,
+            repeat=not self.exit_process,
+            file=self._file,
+            exit=self.exit_process,
+        )
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._file is None:
+            return False
+        faulthandler.cancel_dump_traceback_later()
+        self._file.close()
+        self._file = None
+        try:
+            if self.dump_path is not None and "Thread" not in self.dump_path.read_text(encoding="utf-8"):
+                self.dump_path.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def product_watchdog_dump_path(logger, config) -> Path:
+    for handler in getattr(logger, "handlers", []):
+        base = getattr(handler, "baseFilename", None)
+        if base:
+            return Path(base).with_suffix(".hang.txt")
+    return Path(config.get("log_dir", "competitor_monitor/logs")) / "product_hang_traceback.txt"
+
+
 def run_collection(
     config,
     logger,
@@ -613,6 +593,7 @@ def run_collection(
     enable_sku_matching = bool(config.get("enable_sku_matching", True))
     allow_ambiguous_sku_collection = bool(config.get("allow_ambiguous_sku_collection", False))
     skip_previous_slash_rows = bool(config.get("skip_when_previous_prices_all_slash", False))
+    skip_filled_price_rows = bool(config.get("skip_filled_price_rows", True))
     ambiguous_product_keys = find_ambiguous_product_url_keys(products)
     min_delay = int(config.get("min_delay_seconds", 5))
     max_delay = int(config.get("max_delay_seconds", 10))
@@ -668,7 +649,12 @@ def run_collection(
 
     emit_phase(f"已识别 {stats.total} 条商品，正在启动浏览器并检查淘宝登录")
 
-    with BrowserService(
+    watchdog = ProductWatchdog(
+        float(config.get("product_hang_timeout_seconds", 1800)),
+        product_watchdog_dump_path(logger, config),
+        exit_process=bool(config.get("product_watchdog_exit", False)),
+    )
+    with watchdog, BrowserService(
         headless=bool(config.get("headless", False)),
         timeout_ms=int(config.get("timeout_ms", 30000)),
         user_data_dir=config.get("browser_user_data_dir", "competitor_monitor/browser_profile"),
@@ -708,6 +694,28 @@ def run_collection(
             expected_model = product.name if enable_sku_matching else None
             price_cell = worksheet.cell(row=product.row, column=layout.price_column)
             skip_price = price_cell.value not in (None, "") and not force_overwrite
+            if skip_price and skip_filled_price_rows:
+                stats.skipped += 1
+                logger.info(
+                    "本日价格已存在，跳过：sheet=%s row=%s 商品=%s 价格=%s",
+                    worksheet.title,
+                    product.row,
+                    product.name,
+                    price_cell.value,
+                )
+                emit_progress(processed_count, product, "skipped", error="price_already_filled")
+                continue
+            logger.info(
+                "开始处理第 %s/%s 条：sheet=%s row=%s 商品=%s 链接=%s",
+                processed_count,
+                stats.total,
+                worksheet.title,
+                product.row,
+                product.name,
+                product.url,
+            )
+            emit_phase(f"正在处理第 {processed_count}/{stats.total} 条：{product.name}")
+            watchdog.arm(f"row={product.row} {product.name} {product.url}")
             if (
                 skip_previous_slash_rows
                 and not skip_price
@@ -900,6 +908,12 @@ def run_collection(
                     product.name,
                 )
                 emit_progress(processed_count, product, "failed", error="browser_session_unavailable")
+                if excel_path:
+                    try:
+                        excel.save_workbook(workbook, excel_path)
+                        logger.info("终止前已保存已完成的采集结果：%s", excel_path)
+                    except Exception:
+                        logger.exception("终止前保存 Excel 失败：%s", excel_path)
                 raise
             except Exception as exc:
                 stats.failed += 1

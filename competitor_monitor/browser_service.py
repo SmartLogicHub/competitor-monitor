@@ -196,6 +196,23 @@ def random_delay(min_seconds: float = DEFAULT_OPERATION_MIN_DELAY_SECONDS, max_s
     return delay
 
 
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def set_keep_system_awake(enabled: bool) -> bool:
+    """Ask Windows not to idle-sleep while this thread is collecting; no-op elsewhere."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED if enabled else ES_CONTINUOUS
+        return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
+    except Exception:
+        return False
+
+
 class BrowserService:
     def __init__(
         self,
@@ -226,11 +243,19 @@ class BrowserService:
         self._context = None
 
     def __enter__(self):
-        self._start_runtime()
+        set_keep_system_awake(True)
+        try:
+            self._start_runtime()
+        except BaseException:
+            set_keep_system_awake(False)
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        self._stop_runtime()
+        try:
+            self._stop_runtime()
+        finally:
+            set_keep_system_awake(False)
 
     def _start_runtime(self) -> None:
         try:

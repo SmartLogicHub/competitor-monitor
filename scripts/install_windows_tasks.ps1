@@ -27,7 +27,8 @@ function New-WebConsoleTaskAction {
 function New-CompetitorTaskAction {
     param(
         [string]$Mode,
-        [string]$ExtraArguments = ""
+        [string]$ExtraArguments = "",
+        [int]$MaxAttempts = 1
     )
 
     if ($UseExe) {
@@ -39,13 +40,19 @@ function New-CompetitorTaskAction {
         $runnerDir = Split-Path -Parent $runnerExe
         $runnerCommand = @"
 `$ErrorActionPreference = "Stop"
-`$runnerArgs = @("--mode", "$Mode", "--config", "$configPath")
+`$runnerArgs = @("--mode", "$Mode", "--config", "$configPath", "--date", (Get-Date -Format "yyyy-MM-dd"))
 `$extraArguments = "$ExtraArguments"
 if (-not [string]::IsNullOrWhiteSpace(`$extraArguments)) {
     `$runnerArgs += `$extraArguments.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
 }
-`$process = Start-Process -FilePath "$runnerExe" -ArgumentList `$runnerArgs -WorkingDirectory "$runnerDir" -WindowStyle Hidden -Wait -PassThru
-exit `$process.ExitCode
+`$exitCode = 1
+for (`$attempt = 1; `$attempt -le $MaxAttempts; `$attempt++) {
+    `$process = Start-Process -FilePath "$runnerExe" -ArgumentList `$runnerArgs -WorkingDirectory "$runnerDir" -WindowStyle Hidden -Wait -PassThru
+    `$exitCode = `$process.ExitCode
+    if (`$exitCode -ne 1) { break }
+    if (`$attempt -lt $MaxAttempts) { Start-Sleep -Seconds 60 }
+}
+exit `$exitCode
 "@
         $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($runnerCommand))
         $actionArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand"
@@ -70,7 +77,7 @@ function Register-CompetitorTask {
         [Microsoft.Management.Infrastructure.CimInstance]$Trigger
     )
 
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
     Register-ScheduledTask -TaskName $TaskName -Description $Description -Action $Action -Trigger $Trigger -Settings $settings -Force | Out-Null
     Write-Host "Registered: $TaskName"
 }
@@ -84,7 +91,7 @@ try {
     Write-Warning "Daily and weekly background tasks will still be registered. Start the Web console manually when you need to view it."
 }
 
-$dailyAction = New-CompetitorTaskAction -Mode "daily_price"
+$dailyAction = New-CompetitorTaskAction -Mode "daily_price" -MaxAttempts 3
 $dailyTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At $DailyTime
 Register-CompetitorTask -TaskName "CompetitorMonitor-DailyPrice" -Description "Run daily mature-product price collection and backend WeCom notification" -Action $dailyAction -Trigger $dailyTrigger
 

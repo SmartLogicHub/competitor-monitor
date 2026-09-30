@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rows", default=None, help="Excel rows or ranges, for example 24,54,60-62")
     parser.add_argument("--limit", default=None, help="Limit item count")
     parser.add_argument("--save-every", default=None, help="Save Excel every N processed products")
+    parser.add_argument(
+        "--force-overwrite",
+        action="store_true",
+        help="Re-check rows that already have today's price instead of resuming from the first empty row",
+    )
     return parser.parse_args()
 
 
@@ -38,6 +43,9 @@ def main() -> int:
         "mode": args.mode,
         "dry_run": bool(args.dry_run),
         "test_one": bool(args.test_one),
+        # Background runs have no one watching: a hung product ends this process
+        # (after dumping stacks) instead of blocking the schedule for hours.
+        "watchdog_exit": True,
     }
     if args.run_date:
         payload["run_date"] = args.run_date
@@ -47,6 +55,8 @@ def main() -> int:
         payload["limit"] = args.limit
     if args.save_every:
         payload["save_every"] = args.save_every
+    if args.force_overwrite:
+        payload["force_overwrite"] = True
 
     service = WebApiService(base_dir=base_dir, config_path=config_path)
     print(f"Starting task: mode={payload['mode']} config={display_path(config_path, base_dir)}")

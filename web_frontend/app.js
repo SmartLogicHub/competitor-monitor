@@ -327,9 +327,16 @@
       const filled = Number((state.completeness || {}).filled_count || 0);
       const total = Number((state.completeness || {}).total_count || 0);
       const missingDates = Array.isArray(view.missingDates) ? view.missingDates : [];
+      const completenessInfo = state.completeness || {};
+      const todayDates = Array.isArray(completenessInfo.backfillable_dates) ? completenessInfo.backfillable_dates : missingDates;
+      const historyDates = Array.isArray(completenessInfo.past_missing_dates) ? completenessInfo.past_missing_dates : [];
+      const gapDetail = [
+        todayDates.length ? `今天待补：${todayDates.join("、")}` : "",
+        historyDates.length ? `历史缺失（无法补采）：${historyDates.join("、")}` : ""
+      ].filter(Boolean).join("；");
       const summaryItems = [
         { tone: total && filled === total ? "success" : missingDates.length ? "warning" : "neutral", title: "本周填报", detail: total ? `${filled}/${total} 个价格单元格已填写` : "当前模板暂未识别到价格单元格" },
-        { tone: missingDates.length ? "warning" : "success", title: "缺失日期", detail: missingDates.length ? missingDates.join("、") : "周一到周五价格列已完整" }
+        { tone: todayDates.length || historyDates.length ? "warning" : "success", title: "缺失日期", detail: gapDetail || "截至今天的价格列已完整" }
       ];
       workflowList.innerHTML = summaryItems
         .map(item => `<div class="workflow-item ${item.tone}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.detail)}</span></div>`)
@@ -338,7 +345,7 @@
     }
     const primary = document.getElementById("btn-loop-primary");
     primary.dataset.action = view.primaryAction;
-    primary.textContent = view.primaryAction === "send_template" ? "发送当前模板" : view.primaryAction === "run_daily" ? "运行每日价格" : "补跑缺失日期";
+    primary.textContent = view.primaryAction === "send_template" ? "发送当前模板" : view.primaryAction === "run_daily" ? "运行每日价格" : "补跑今天价格";
   }
 
   function renderConfig() {
@@ -348,7 +355,6 @@
     value("cfg-price-trend-time", config.price_trend_time || "18:30");
     value("cfg-bi-sat", String(Boolean(config.bi_run_saturday)));
     value("cfg-bi-sun", String(Boolean(config.bi_run_sunday)));
-    value("cfg-auto-backfill", String(Boolean(config.auto_backfill_missing_daily_prices_before_weekly_new)));
     value("cfg-wecom-enabled", String(Boolean(config.wecom_enabled)));
     value("cfg-wecom-summary", String(Boolean(config.wecom_send_summary)));
     value("cfg-wecom-template", String(Boolean(config.wecom_send_excel_file)));
@@ -388,6 +394,7 @@
     value("cfg-rows", config.rows || "");
     value("cfg-limit", config.limit || "");
     value("cfg-save-every", config.save_every ?? 5);
+    value("cfg-force-overwrite", "false");
     text("daily-schedule", `每天 ${config.daily_run_time || "10:00"}`);
     const weeklyDays = [config.bi_run_saturday ? "周六" : "", config.bi_run_sunday ? "周日" : ""].filter(Boolean).join(" / ");
     text("weekly-schedule", weeklyDays ? `${weeklyDays} ${config.weekly_new_time || "09:30"}` : "未启用");
@@ -540,15 +547,19 @@
   }
 
   async function backfillMissingDates() {
-    const missing = state.completeness ? state.completeness.missing_dates : [];
-    if (!missing.length) {
-      toast("模板已完整，无需补跑", "success");
+    // Product pages only show today's price, so only today's column can be backfilled.
+    const completeness = state.completeness || {};
+    const todayDates = Array.isArray(completeness.backfillable_dates) ? completeness.backfillable_dates : [];
+    const historyDates = Array.isArray(completeness.past_missing_dates) ? completeness.past_missing_dates : [];
+    if (!todayDates.length) {
+      toast(historyDates.length ? `今天的价格无需补跑；历史日期（${historyDates.join("、")}）无法补采` : "今天的价格已完整，无需补跑", "success");
       return;
     }
-    if (!confirm(`确认补跑缺失日期？\n\n缺失日期：${missing.join("、")}\n\n补跑会启动后端安全任务，运行中不能重复启动。`)) return;
+    const historyNote = historyDates.length ? `\n历史缺失日期（${historyDates.join("、")}）无法补采，不会处理。` : "";
+    if (!confirm(`确认补跑今天（${todayDates[0]}）的价格？\n\n只采集今天还没有价格的商品，已有价格的行会跳过。${historyNote}`)) return;
     await withButtonLoading("btn-backfill-missing", async () => {
-      await API.backfillTemplate({ dates: missing });
-      toast("缺失日期已提交补跑", "success");
+      await API.backfillTemplate({ dates: todayDates });
+      toast("已提交补跑今天价格", "success");
       await refreshAll();
     });
   }
@@ -587,7 +598,6 @@
       price_trend_time: document.getElementById("cfg-price-trend-time").value,
       bi_run_saturday: document.getElementById("cfg-bi-sat").value === "true",
       bi_run_sunday: document.getElementById("cfg-bi-sun").value === "true",
-      auto_backfill_missing_daily_prices_before_weekly_new: document.getElementById("cfg-auto-backfill").value === "true",
       wecom_enabled: document.getElementById("cfg-wecom-enabled").value === "true",
       wecom_send_summary: document.getElementById("cfg-wecom-summary").value === "true",
       wecom_send_excel_file: document.getElementById("cfg-wecom-template").value === "true",
@@ -697,6 +707,7 @@
       limit: document.getElementById("cfg-limit").value,
       save_every: Number(document.getElementById("cfg-save-every").value || 0)
     };
+    if (document.getElementById("cfg-force-overwrite").value === "true") payload.force_overwrite = true;
     if (runDate) payload.run_date = runDate;
     Object.keys(payload).forEach(key => {
       if (payload[key] === "" || payload[key] === 0) delete payload[key];

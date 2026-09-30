@@ -185,7 +185,7 @@
             <div class="task-actions">
               <button id="btn-run-weekly" class="btn secondary" type="button">手动运行 BI</button>
               <button id="btn-rerun-weekly" class="btn secondary" type="button">补跑上次 BI</button>
-              <button id="btn-backfill-missing" class="btn ghost" type="button">补跑缺失日期</button>
+              <button id="btn-backfill-missing" class="btn ghost" type="button">补跑今天价格</button>
             </div>
             <div class="task-running-note" id="weekly-running-note" hidden>
               <div class="task-running-note-main">
@@ -215,7 +215,7 @@
             </div>
             <div class="button-row">
               <button id="btn-loop-check" class="btn ghost small" type="button">检查完整性</button>
-              <button id="btn-loop-primary" class="btn secondary small" type="button">补跑缺失日期</button>
+              <button id="btn-loop-primary" class="btn secondary small" type="button">补跑今天价格</button>
             </div>
           </div>
           <div class="loop-meta">
@@ -379,7 +379,6 @@
               <label class="field">价格情况时间<input id="cfg-price-trend-time" class="form-control" type="time" value="18:30"></label>
               <label class="field">允许周六运行 BI<select id="cfg-bi-sat" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
               <label class="field">允许周日运行 BI<select id="cfg-bi-sun" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
-              <label class="field">缺失自动补跑<select id="cfg-auto-backfill" class="form-control"><option value="true">开启</option><option value="false">关闭</option></select></label>
             </div>
           </section>
 
@@ -569,6 +568,7 @@
               <label class="field">行范围<input id="cfg-rows" class="form-control" type="text" placeholder="如 24,54,60-62"></label>
               <label class="field">限制数量<input id="cfg-limit" class="form-control" type="number" min="0"></label>
               <label class="field">保存间隔<input id="cfg-save-every" class="form-control" type="number" min="0"></label>
+              <label class="field">当天已填价格<select id="cfg-force-overwrite" class="form-control"><option value="false">跳过（断点续跑）</option><option value="true">全部重查并覆盖</option></select></label>
             </div>
           </section>
         </form>

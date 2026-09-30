@@ -34,7 +34,6 @@
       daily_run_time: "10:00",
       bi_run_saturday: true,
       bi_run_sunday: true,
-      auto_backfill_missing_daily_prices_before_weekly_new: true,
       wecom_enabled: true,
       wecom_send_summary: true,
       wecom_send_excel_file: true,
@@ -128,6 +127,8 @@
       complete: false,
       energy_percent: 80,
       missing_dates: [firstMissingDate],
+      backfillable_dates: [firstMissingDate],
+      past_missing_dates: [],
       days: Array.from({ length: 5 }, (_, index) => {
         const day = addDays(monday, index);
         const date = toDateInput(day);

@@ -154,7 +154,7 @@ class WebApiService:
             return self._sanitize(status)
 
     def get_template_completeness(self, date_text: str | None = None) -> dict[str, Any]:
-        reference_date = _parse_date(date_text) if date_text else date.today()
+        reference_date = _parse_date(date_text) if date_text else self.today_provider()
         config = self._load_config()
         excel_path = self._active_workbook_path(config)
         if excel_path.exists():
@@ -162,7 +162,9 @@ class WebApiService:
             try:
                 excel = ExcelService(excel_path)
                 workbook = excel.load_workbook()
-                return self._template_completeness_to_dict(excel.check_weekly_price_completeness(workbook, reference_date))
+                return self._with_today_backfill_info(
+                    self._template_completeness_to_dict(excel.check_weekly_price_completeness(workbook, reference_date))
+                )
             except Exception as exc:
                 self.log("error", "模板完整性检查失败", str(exc))
             finally:
@@ -184,17 +186,33 @@ class WebApiService:
                     "missing_rows": [],
                 }
             )
-        return {
-            "sheet_name": None,
-            "period_start": week.monday.isoformat(),
-            "period_end": week.friday.isoformat(),
-            "complete": False,
-            "filled_count": 0,
-            "total_count": 0,
-            "energy_percent": 0,
-            "missing_dates": [day["date"] for day in days],
-            "days": days,
-        }
+        return self._with_today_backfill_info(
+            {
+                "sheet_name": None,
+                "period_start": week.monday.isoformat(),
+                "period_end": week.friday.isoformat(),
+                "complete": False,
+                "filled_count": 0,
+                "total_count": 0,
+                "energy_percent": 0,
+                "missing_dates": [day["date"] for day in days],
+                "days": days,
+            }
+        )
+
+    def _with_today_backfill_info(self, completeness: dict[str, Any]) -> dict[str, Any]:
+        """Only today's price column can still be collected; earlier gaps are history."""
+        today = self.today_provider().isoformat()
+        backfillable_statuses = {"missing_sheet", "missing", "partial"}
+        today_day = next((day for day in completeness.get("days", []) if day.get("date") == today), None)
+        completeness["today"] = today
+        completeness["backfillable_dates"] = (
+            [today] if today_day and today_day.get("status") in backfillable_statuses else []
+        )
+        completeness["past_missing_dates"] = [
+            item for item in completeness.get("missing_dates", []) if str(item) < today
+        ]
+        return completeness
 
     def run_task(self, payload: dict[str, Any]) -> dict[str, str]:
         with self.lock:
@@ -329,12 +347,19 @@ class WebApiService:
                 }
             if self._is_running_locked():
                 return {"message": "已有任务正在运行"}
-            dates = [str(item) for item in (payload.get("dates") or []) if str(item).strip()]
-            if not dates:
-                completeness = self.get_template_completeness(payload.get("date"))
-                dates = list(completeness.get("missing_dates") or [])
-            if not dates:
-                return {"message": "没有需要补跑的日期", "backfilled_dates": []}
+            # Product pages only show today's price, so only today's column can be filled;
+            # writing it into another date's column would record a wrong price.
+            today = self.today_provider().isoformat()
+            requested = [str(item) for item in (payload.get("dates") or []) if str(item).strip()]
+            skipped_dates = [item for item in requested if item != today]
+            completeness = self.get_template_completeness(today)
+            if today not in (completeness.get("backfillable_dates") or []):
+                return {
+                    "message": "今天的价格无需补跑；历史日期无法补采",
+                    "backfilled_dates": [],
+                    "skipped_dates": skipped_dates,
+                }
+            dates = [today]
             self.stop_event.clear()
             first_date = _parse_date(dates[0])
             week = get_work_week(first_date)
@@ -362,8 +387,8 @@ class WebApiService:
             self._persist_status_locked()
             self.current_thread = threading.Thread(target=self._run_backfill_in_thread, args=(dates,), daemon=True)
             self.current_thread.start()
-            self.log("info", "补跑任务已启动", "、".join(dates))
-            return {"message": "补跑任务已启动", "backfilled_dates": dates}
+            self.log("info", "补跑任务已启动", f"只补今天 {today} 尚未采集的商品")
+            return {"message": "补跑任务已启动", "backfilled_dates": dates, "skipped_dates": skipped_dates}
 
     def send_template(self) -> dict[str, str]:
         config = self._load_config()
@@ -432,9 +457,6 @@ class WebApiService:
             "price_trend_time": config.get("price_trend_time", "18:30"),
             "bi_run_saturday": 5 in _weekdays(config.get("new_product_allowed_weekdays", [5, 6])),
             "bi_run_sunday": 6 in _weekdays(config.get("new_product_allowed_weekdays", [5, 6])),
-            "auto_backfill_missing_daily_prices_before_weekly_new": bool(
-                config.get("auto_backfill_missing_daily_prices_before_weekly_new", True)
-            ),
             "wecom_enabled": bool(config.get("wecom_enabled", False)),
             "wecom_send_summary": bool(config.get("wecom_send_summary", True)),
             "wecom_send_excel_file": bool(config.get("wecom_send_excel_file", True)),
@@ -468,7 +490,6 @@ class WebApiService:
             "daily_run_time",
             "weekly_new_time",
             "price_trend_time",
-            "auto_backfill_missing_daily_prices_before_weekly_new",
             "wecom_enabled",
             "wecom_send_summary",
             "wecom_send_excel_file",
@@ -871,6 +892,10 @@ class WebApiService:
         from logger_service import setup_logger
 
         config = self._runtime_config(self._load_config())
+        if context.payload.get("watchdog_exit"):
+            config["product_watchdog_exit"] = True
+        if context.payload.get("force_overwrite"):
+            config["force_overwrite"] = True
         run_date = _parse_date(context.payload.get("run_date")) if context.payload.get("run_date") else self.today_provider()
         mode = context.payload.get("mode") or "daily_price"
         primary_excel_path = self._resolve_path(config.get("excel_path", "竞品监控.xlsx"))
@@ -1165,25 +1190,32 @@ function Register-CompetitorRunnerTask {{
         [string]$Description,
         [string]$Mode,
         [string[]]$Days,
-        [string]$AtTime
+        [string]$AtTime,
+        [int]$MaxAttempts = 1
     )
     $runnerExe = { _ps_quote(str(runner_path)) }
     $runnerDir = { _ps_quote(str(runner_dir)) }
     $configPath = { _ps_quote(str(config_path)) }
     $runnerCommand = @"
 `$ErrorActionPreference = "Stop"
-`$runnerArgs = @("--mode", "$Mode", "--config", "$configPath")
-`$process = Start-Process -FilePath "$runnerExe" -ArgumentList `$runnerArgs -WorkingDirectory "$runnerDir" -WindowStyle Hidden -Wait -PassThru
-exit `$process.ExitCode
+`$runnerArgs = @("--mode", "$Mode", "--config", "$configPath", "--date", (Get-Date -Format "yyyy-MM-dd"))
+`$exitCode = 1
+for (`$attempt = 1; `$attempt -le $MaxAttempts; `$attempt++) {{
+    `$process = Start-Process -FilePath "$runnerExe" -ArgumentList `$runnerArgs -WorkingDirectory "$runnerDir" -WindowStyle Hidden -Wait -PassThru
+    `$exitCode = `$process.ExitCode
+    if (`$exitCode -ne 1) {{ break }}
+    if (`$attempt -lt $MaxAttempts) {{ Start-Sleep -Seconds 60 }}
+}}
+exit `$exitCode
 "@
     $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($runnerCommand))
     $actionArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand"
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArgs -WorkingDirectory $runnerDir
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Days -At $AtTime
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
     Register-ScheduledTask -TaskName $TaskName -Description $Description -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 }}
-Register-CompetitorRunnerTask -TaskName "CompetitorMonitor-DailyPrice" -Description "Run daily mature-product price collection and backend WeCom notification" -Mode "daily_price" -Days @("Monday","Tuesday","Wednesday","Thursday","Friday") -AtTime { _ps_quote(daily_time) }
+Register-CompetitorRunnerTask -TaskName "CompetitorMonitor-DailyPrice" -Description "Run daily mature-product price collection and backend WeCom notification" -Mode "daily_price" -Days @("Monday","Tuesday","Wednesday","Thursday","Friday") -AtTime { _ps_quote(daily_time) } -MaxAttempts 3
 Register-CompetitorRunnerTask -TaskName "CompetitorMonitor-PriceTrend" -Description "Run Friday price trend analysis" -Mode "price_trend" -Days @("Friday") -AtTime { _ps_quote(trend_time) }
 """
         if weekly_days:

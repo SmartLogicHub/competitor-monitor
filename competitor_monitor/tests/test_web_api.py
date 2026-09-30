@@ -59,26 +59,45 @@ class WebApiServiceTest(unittest.TestCase):
         self.assertEqual(status["system_status"], "partial_success")
         self.assertEqual(status["failed_count"], 1)
 
-    def test_backfill_continues_after_one_date_fails(self):
+    def test_backfill_only_collects_today_and_skips_history(self):
         attempted = []
 
         def runner(context: RunContext) -> None:
-            run_date = context.payload["run_date"]
-            attempted.append(run_date)
-            if run_date == "2026-07-01":
-                raise RuntimeError("first date failed")
-            context.record_result({"mode": "daily_price", "model": run_date, "status": "success"})
+            attempted.append(context.payload["run_date"])
+            context.record_result({"mode": "daily_price", "model": "P1", "status": "success"})
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            service = WebApiService(base_dir=Path(tmpdir), runner=runner)
-            service.backfill_template({"dates": ["2026-07-01", "2026-07-02"]})
+            service = WebApiService(base_dir=Path(tmpdir), runner=runner, today_provider=lambda: date(2026, 7, 8))
+            response = service.backfill_template({"dates": ["2026-07-06", "2026-07-08", "2026-07-09"]})
             service.wait_for_current_task(timeout=1)
 
-            status = service.get_tasks_status()
+        self.assertEqual(attempted, ["2026-07-08"])
+        self.assertEqual(response["backfilled_dates"], ["2026-07-08"])
+        self.assertEqual(response["skipped_dates"], ["2026-07-06", "2026-07-09"])
 
-        self.assertEqual(attempted, ["2026-07-01", "2026-07-02"])
-        self.assertEqual(status["system_status"], "partial_success")
-        self.assertEqual(status["failed_count"], 1)
+    def test_backfill_does_nothing_on_weekend_because_history_cannot_be_collected(self):
+        attempted = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(
+                base_dir=Path(tmpdir),
+                runner=lambda context: attempted.append(context.payload["run_date"]),
+                today_provider=lambda: date(2026, 7, 11),
+            )
+            response = service.backfill_template({"dates": ["2026-07-06", "2026-07-07"]})
+            service.wait_for_current_task(timeout=1)
+
+        self.assertEqual(attempted, [])
+        self.assertEqual(response["backfilled_dates"], [])
+        self.assertIn("历史日期无法补采", response["message"])
+
+    def test_completeness_marks_only_today_as_backfillable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = WebApiService(base_dir=Path(tmpdir), today_provider=lambda: date(2026, 7, 8))
+            completeness = service.get_template_completeness()
+
+        self.assertEqual(completeness["today"], "2026-07-08")
+        self.assertEqual(completeness["backfillable_dates"], ["2026-07-08"])
+        self.assertEqual(completeness["past_missing_dates"], ["2026-07-06", "2026-07-07"])
 
     def test_import_taobao_cookies_writes_configured_storage_without_echoing_secrets(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -585,6 +604,13 @@ class WebApiServiceTest(unittest.TestCase):
             self.assertIn("-WindowStyle Hidden -Wait -PassThru", script)
             self.assertIn("-RestartCount 3", script)
             self.assertIn("-RestartInterval (New-TimeSpan -Minutes 10)", script)
+            self.assertIn("-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun", script)
+            self.assertIn('"--date", (Get-Date -Format "yyyy-MM-dd")', script)
+            self.assertIn("if (`$exitCode -ne 1) { break }", script)
+            daily_line = next(line for line in script.splitlines() if '-Mode "daily_price"' in line)
+            self.assertTrue(daily_line.endswith("-MaxAttempts 3"))
+            trend_line = next(line for line in script.splitlines() if '-Mode "price_trend"' in line)
+            self.assertNotIn("-MaxAttempts", trend_line)
             self.assertNotIn('$action = New-ScheduledTaskAction -Execute $runnerExe', script)
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 self.assertEqual(captured["kwargs"].get("creationflags"), subprocess.CREATE_NO_WINDOW)
@@ -1179,7 +1205,7 @@ class WebApiServiceTest(unittest.TestCase):
                 time.sleep(0.01)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            service = WebApiService(base_dir=Path(tmpdir), runner=runner)
+            service = WebApiService(base_dir=Path(tmpdir), runner=runner, today_provider=lambda: date(2026, 7, 6))
 
             response = service.backfill_template({"dates": ["2026-07-06"]})
             self.assertEqual(response["message"], "补跑任务已启动")

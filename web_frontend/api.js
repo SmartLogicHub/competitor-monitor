@@ -72,8 +72,9 @@
         );
         mock.completeness.missing_dates = mock.completeness.days.filter(day => day.status !== "complete").map(day => day.date);
         mock.completeness.complete = mock.completeness.missing_dates.length === 0;
+        mock.completeness.backfillable_dates = [];
         mock.completeness.energy_percent = mock.completeness.complete ? 100 : mock.completeness.energy_percent;
-        mock.logs.unshift(makeLog("success", `已补跑缺失日期：${targetDates.join("、")}`, "补跑结果已写入并保存到主 Excel 模板。"));
+        mock.logs.unshift(makeLog("success", `已补跑今天价格：${targetDates.join("、")}`, "补跑结果已写入并保存到主 Excel 模板。"));
         return { message: "补跑完成", backfilled_dates: targetDates };
       });
     }
